@@ -1,0 +1,72 @@
+{
+  "_comment": "Example roster. Copy to agents.json and fill in real hosts. Each agent: name, host (user@host or 'local'), platform, hermes_home, enabled, role. Optional 'python' pins an interpreter when the box has no usable python on PATH. Set enabled:false with a blocked_reason to keep an unreachable machine visible instead of forgotten.",
+  "agents": [
+    {
+      "name": "agent-01",
+      "host": "local",
+      "platform": "macos",
+      "hermes_home": "~/.hermes",
+      "enabled": true,
+      "role": "origin",
+      "authoring": true
+    },
+    {
+      "name": "agent-02",
+      "host": "USER@10.0.0.2",
+      "platform": "windows",
+      "hermes_home": "%LOCALAPPDATA%\\hermes",
+      "enabled": true,
+      "role": "sentinel",
+      "authoring": false
+    },
+    {
+      "name": "agent-03",
+      "host": "USER@10.0.0.3",
+      "platform": "windows",
+      "hermes_home": "%LOCALAPPDATA%\\hermes",
+      "enabled": true,
+      "role": "worker",
+      "authoring": false
+    },
+    {
+      "name": "agent-04",
+      "host": "USER@10.0.0.4",
+      "platform": "windows",
+      "hermes_home": "%LOCALAPPDATA%\\hermes",
+      "enabled": true,
+      "role": "worker",
+      "authoring": false
+    },
+    {
+      "name": "agent-05",
+      "host": "USER@10.0.0.5",
+      "platform": "windows",
+      "hermes_home": "%LOCALAPPDATA%\\hermes",
+      "enabled": true,
+      "role": "worker",
+      "authoring": false,
+      "python": "PATH-TO-PYTHON"
+    },
+    {
+      "name": "agent-06",
+      "host": "USER@10.0.0.6",
+      "platform": "windows",
+      "hermes_home": "%LOCALAPPDATA%\\hermes",
+      "enabled": true,
+      "role": "worker",
+      "authoring": false,
+      "python": "PATH-TO-PYTHON"
+    },
+    {
+      "name": "agent-07",
+      "host": "USER@10.0.0.7",
+      "platform": "windows",
+      "hermes_home": "%LOCALAPPDATA%\\hermes",
+      "enabled": true,
+      "role": "worker",
+      "authoring": false,
+      "python": "PATH-TO-PYTHON"
+    }
+  ],
+  "unreachable_not_enrolled": []
+}
