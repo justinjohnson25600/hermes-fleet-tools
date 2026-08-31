@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import re
 import subprocess
 import sys
@@ -32,6 +33,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+_ROSTER_OVERRIDE: str | None = None
 RAW = os.environ.get(
     "FLEET_SKILLS_RAW",
     "https://raw.githubusercontent.com/YOUR-ORG/YOUR-SKILLS-REPO/main",
@@ -141,7 +143,26 @@ print(json.dumps(rep))
 
 
 def load_agents() -> dict:
-    return json.loads((ROOT / "agents.json").read_text(encoding="utf-8"))
+    """Read the roster.
+
+    The roster is DATA and lives wherever the operator keeps it — commonly a
+    separate private repo, since it holds real hostnames and usernames while
+    this tool is meant to be shareable. Resolution order:
+
+      1. --roster / FLEET_ROSTER   explicit path
+      2. ./agents.json             the working directory
+      3. alongside this script     the single-repo case
+    """
+    for cand in (_ROSTER_OVERRIDE, os.environ.get("FLEET_ROSTER"),
+                 Path.cwd() / "agents.json", Path.cwd() / "roster" / "agents.json",
+                 ROOT / "agents.json"):
+        if cand and Path(cand).is_file():
+            return json.loads(Path(cand).read_text(encoding="utf-8"))
+    raise SystemExit(
+        "no roster found. Looked for --roster/FLEET_ROSTER, ./agents.json, "
+        "./roster/agents.json, and one beside deploy.py.\n"
+        "Copy agents.example.json to agents.json and fill in your hosts."
+    )
 
 
 def wait_for_cdn(skills: list[str], timeout: int = 420) -> dict:
@@ -149,11 +170,23 @@ def wait_for_cdn(skills: list[str], timeout: int = 420) -> dict:
     release: raw.githubusercontent caches, and boxes install the previous one."""
     want = {}
     for s in skills:
+        # Local manifest if this repo also holds the skills; otherwise ask the
+        # remote what version it believes is current and wait for that to settle.
         f = ROOT / s / "skill.json"
         if f.is_file():
             want[s] = json.loads(f.read_text(encoding="utf-8"))["version"]
     if not want:
-        return {}
+        # Nothing local to compare against: poll the remote until two reads
+        # agree, which clears a mid-propagation cache without needing to know
+        # the target version.
+        seen = {}
+        for s in skills:
+            try:
+                with urllib.request.urlopen(f"{RAW}/{s}/skill.json?cb={time.time()}", timeout=30) as r:
+                    seen[s] = json.loads(r.read().decode()).get("version")
+            except Exception:
+                seen[s] = None
+        return {"want": seen, "serving": seen, "current": True}
     deadline = time.time() + timeout
     while True:
         seen, ok = {}, True
@@ -205,7 +238,11 @@ def main() -> int:
     ap.add_argument("--list", action="store_true", help="show agents and exit")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--no-wait", action="store_true", help="skip the CDN freshness wait")
+    ap.add_argument("--roster", help="path to agents.json (default: ./agents.json, ./roster/agents.json, or beside this script)")
     args = ap.parse_args()
+
+    global _ROSTER_OVERRIDE
+    _ROSTER_OVERRIDE = args.roster
 
     cfg = load_agents()
     agents = cfg["agents"]
@@ -222,11 +259,14 @@ def main() -> int:
 
     skills = args.skills
     if args.all or not skills:
-        skills = json.loads((ROOT / "skills.json").read_text(encoding="utf-8"))
-    for s in skills:
-        if not (ROOT / s).is_dir():
-            print(f"no such skill in this repo: {s}")
+        manifest = ROOT / "skills.json"
+        if not manifest.is_file():
+            print("--all needs a skills.json listing skill names, or name skills explicitly.")
             return 1
+        skills = json.loads(manifest.read_text(encoding="utf-8"))
+    # Skills are fetched from the remote source at install time, so there is
+    # nothing local to validate against. A name that does not exist upstream
+    # surfaces as a per-agent install failure, which is the honest place for it.
 
     targets = [a for a in agents if a["enabled"]]
     skipped = [a for a in agents if not a["enabled"]]
