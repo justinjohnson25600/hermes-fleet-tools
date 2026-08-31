@@ -15,7 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from fleettools.fleet_report import (           # noqa: E402
-    BEHIND, BLOCKED, CURRENT, DIVERGED, SHALLOW, UNKNOWN, UNREACHABLE,
+    BEHIND, BLOCKED, CURRENT, DIVERGED, SHALLOW, UNKNOWN, UNREACHABLE, UNTRACKED,
     classify, parse_kv, parse_sections,
 )
 
@@ -42,10 +42,38 @@ def rec(check=CHECK_AVAILABLE, git="", cli="C:\\path\\hermes.exe", **kw):
 
 
 def git_block(head=HEAD_A, upstream=HEAD_B, behind="5", ahead="0",
-              stashes="0", dirty="0", shallow="false", mergebase=HEAD_A):
-    return (f"HEAD={head}\nUPSTREAM={upstream}\nBRANCH=main\nSHALLOW={shallow}\n"
-            f"BEHIND={behind}\nAHEAD={ahead}\nMERGEBASE={mergebase}\n"
-            f"STASHES={stashes}\nDIRTY={dirty}")
+              stashes="0", dirty="0", shallow="false", mergebase=HEAD_A,
+              branch="main", originhead=None, behindorigin=None, aheadorigin=None):
+    block = (f"HEAD={head}\nUPSTREAM={upstream}\nBRANCH={branch}\nSHALLOW={shallow}\n"
+             f"BEHIND={behind}\nAHEAD={ahead}\nMERGEBASE={mergebase}\n"
+             f"STASHES={stashes}\nDIRTY={dirty}")
+    if originhead is not None:
+        block += f"\nORIGINHEAD={originhead}"
+    if behindorigin is not None:
+        block += f"\nBEHINDORIGIN={behindorigin}"
+    if aheadorigin is not None:
+        block += f"\nAHEADORIGIN={aheadorigin}"
+    return block
+
+
+def test_untracked_branch_measured_against_origin_main():
+    """The SENTINEL box runs a deliberate `local-patches` branch with no
+    upstream. That is a real state to report, not an UNKNOWN to give up on."""
+    verdict, reasons = classify(rec(git=git_block(
+        upstream="", mergebase="", branch="local-patches",
+        originhead=HEAD_B, behindorigin="151", aheadorigin="8")))
+    assert verdict == UNTRACKED
+    assert "local-patches" in reasons[0] and "no upstream" in reasons[0]
+    assert any("8 local commit(s) not in origin/main" in r for r in reasons)
+    assert any("151 commit(s) behind origin/main" in r for r in reasons)
+
+
+def test_falsify_untracked_without_fallback_is_unknown():
+    """If origin/main is unreadable too, there is nothing to measure against."""
+    verdict, reasons = classify(rec(git=git_block(upstream="", mergebase="",
+                                                  branch="local-patches")))
+    assert verdict == UNKNOWN
+    assert "no origin/main fallback" in reasons[0]
 
 
 # --- parsing ----------------------------------------------------------------

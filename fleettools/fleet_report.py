@@ -74,6 +74,12 @@ if (Test-Path $repo) {
   Write-Output ('MERGEBASE='  + (git merge-base HEAD '@{u}' 2>&1))
   Write-Output ('STASHES='    + ((git stash list 2>&1 | Measure-Object -Line).Lines))
   Write-Output ('DIRTY='      + ((git status --porcelain 2>&1 | Measure-Object -Line).Lines))
+  # A branch with no upstream cannot answer @{u}. Fall back to the default
+  # remote branch so a deliberately-patched checkout still reports real drift
+  # instead of collapsing to UNKNOWN.
+  Write-Output ('ORIGINHEAD=' + (git rev-parse origin/main 2>&1))
+  Write-Output ('BEHINDORIGIN=' + (git rev-list --count 'HEAD..origin/main' 2>&1))
+  Write-Output ('AHEADORIGIN='  + (git rev-list --count 'origin/main..HEAD' 2>&1))
   Pop-Location
 } else { Write-Output 'REPO_MISSING=1' }
 Write-Output '===DESKTOP==='
@@ -99,6 +105,9 @@ if [ -d "$repo" ]; then
   echo "MERGEBASE=$(git merge-base HEAD '@{u}' 2>&1)"
   echo "STASHES=$(git stash list 2>/dev/null | wc -l | tr -d ' ')"
   echo "DIRTY=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+  echo "ORIGINHEAD=$(git rev-parse origin/main 2>&1)"
+  echo "BEHINDORIGIN=$(git rev-list --count HEAD..origin/main 2>&1)"
+  echo "AHEADORIGIN=$(git rev-list --count origin/main..HEAD 2>&1)"
 else
   echo 'REPO_MISSING=1'
 fi
@@ -117,10 +126,11 @@ UNKNOWN     = "UNKNOWN"       # probe ran, output not understood. NEVER silent.
 BLOCKED     = "BLOCKED"       # rate-limited / not-a-repo / no CLI
 SHALLOW     = "SHALLOW"       # clone cannot answer "how far behind"
 DIVERGED    = "DIVERGED"      # real local commits ahead of upstream
+UNTRACKED   = "UNTRACKED"     # branch has no upstream ref; measured vs origin/main
 BEHIND      = "BEHIND"
 CURRENT     = "CURRENT"
 
-PROBLEM_VERDICTS = {UNREACHABLE, UNKNOWN, BLOCKED, SHALLOW, DIVERGED}
+PROBLEM_VERDICTS = {UNREACHABLE, UNKNOWN, BLOCKED, SHALLOW, DIVERGED, UNTRACKED}
 
 RX_BEHIND_PROSE = re.compile(r"(\d+)\s+commits?\s+behind", re.I)
 RX_RATELIMIT    = re.compile(r"rate.?limit|HTTP 429", re.I)
@@ -209,8 +219,21 @@ def classify(rec: dict) -> tuple[str, list[str]]:
         return SHALLOW, reasons
 
     if not upstream or len(upstream) < 40:
-        return UNKNOWN, ["could not resolve the upstream ref (@{u}) — drift "
-                         "cannot be measured this cycle"] + reasons
+        # No upstream ref. On this estate that means a deliberately-patched
+        # branch (e.g. `local-patches`), not a fault -- so measure against the
+        # default remote branch rather than reporting UNKNOWN and giving up.
+        origin_head = git.get("ORIGINHEAD", "").strip()
+        b_org, a_org = _int(git.get("BEHINDORIGIN")), _int(git.get("AHEADORIGIN"))
+        branch = git.get("BRANCH", "").strip() or "?"
+        if len(origin_head) >= 40 and b_org is not None and a_org is not None:
+            detail = [f"on branch '{branch}' with no upstream tracking ref"]
+            if a_org:
+                detail.append(f"{a_org} local commit(s) not in origin/main")
+            if b_org:
+                detail.append(f"{b_org} commit(s) behind origin/main")
+            return UNTRACKED, detail + reasons
+        return UNKNOWN, ["could not resolve the upstream ref (@{u}) and no "
+                         "origin/main fallback was readable"] + reasons
 
     if behind is None or ahead is None:
         return UNKNOWN, ["git did not return usable ahead/behind counts"]
