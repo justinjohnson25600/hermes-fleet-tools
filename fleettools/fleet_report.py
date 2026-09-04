@@ -317,6 +317,38 @@ def load_roster(path: str | None) -> dict:
     sys.exit("fleet_report: no roster found (set FLEET_ROSTER or pass --roster)")
 
 
+def emit_staleness_banner(state_dir, max_age_mins=180, stream=None):
+    """Print a STALE DATA banner when the sweep heartbeat is older than max_age_mins.
+
+    The 2026-09-03 incident: a 5.6h-old fleet-heartbeat.json was served as a
+    current status because nothing on the report's face carried its age. The
+    banner is printed to STDOUT (the quiet-watchdog contract: stdout IS the
+    human channel; this is warranted signal, not noise) alongside the normal
+    table - stale data must be labelled, never suppressed.
+
+    Fail-open by design on unknowable age (no heartbeat file, unparseable ts,
+    unreadable dir): an unknown age is not a false one. That condition has a
+    different owner (the deadman cron) and must not cry wolf here.
+    """
+    import sys as _sys
+    out = stream if stream is not None else _sys.stdout
+    try:
+        hb_path = Path(state_dir) / "fleet-heartbeat.json"
+        raw = json.loads(hb_path.read_text(encoding="utf-8"))
+        ts = datetime.fromisoformat(str(raw.get("ts", "")))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    age_h = (datetime.now(timezone.utc) - ts).total_seconds() / 3600.0
+    if age_h * 60 <= max_age_mins:
+        return
+    print(
+        "STALE DATA: sweep is %.1f h old — re-run before trusting these numbers" % age_h,
+        file=out,
+    )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Report update-drift across the fleet (read-only).")
     ap.add_argument("--roster")
@@ -327,7 +359,13 @@ def main() -> int:
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--quiet", action="store_true",
                     help="print only changes and problems; silence means all-clear")
+    ap.add_argument("--max-age-mins", type=int, default=180,
+                    help="STALE DATA banner threshold on the heartbeat's age (default 180)")
     args = ap.parse_args()
+
+    # Staleness first: label stale data on the report's face BEFORE any table,
+    # so a reader can never mistake an old sweep for a current one (2026-09-03).
+    emit_staleness_banner(args.state, max_age_mins=args.max_age_mins)
 
     roster = load_roster(args.roster)
     agents = [a for a in roster.get("agents", []) if a.get("enabled")]

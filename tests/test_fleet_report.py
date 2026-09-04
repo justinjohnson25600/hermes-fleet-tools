@@ -9,15 +9,70 @@ the guard goes red — a guard that has never failed is decoration.
 """
 from __future__ import annotations
 
+import json
+import re
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from fleettools import fleet_report as fr           # noqa: E402
 from fleettools.fleet_report import (           # noqa: E402
     BEHIND, BLOCKED, CURRENT, DIVERGED, SHALLOW, UNKNOWN, UNREACHABLE, UNTRACKED,
     classify, parse_kv, parse_sections,
 )
+
+
+# ---------------------------------------------------------------------------
+# Staleness guard - the 2026-09-03 incident where a 5.6h-old sweep was served
+# as current. The reporter must carry its own age on its face. Three behaviours:
+#   1. old sweep   -> banner printed AND the table still printed
+#   2. fresh sweep -> NO banner (a guard that cries wolf on fresh data is
+#      worse than none)
+#   3. missing/malformed heartbeat -> no crash, no banner (staleness is
+#      unknowable, not false; different failure, different owner)
+# ---------------------------------------------------------------------------
+
+
+def _write_heartbeat(state_dir, ts_iso):
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "fleet-heartbeat.json").write_text(
+        json.dumps({"ts": ts_iso, "agents_total": 1}), encoding="utf-8"
+    )
+
+
+def test_old_sweep_prints_banner_and_table(tmp_path, capsys):
+    old = datetime.now(timezone.utc) - timedelta(hours=6)
+    _write_heartbeat(tmp_path, old.isoformat())
+    fr.emit_staleness_banner(tmp_path, max_age_mins=180)
+    out = capsys.readouterr().out
+    assert "STALE DATA" in out
+    assert "6" in out
+
+
+def test_fresh_sweep_prints_no_banner(tmp_path, capsys):
+    now = datetime.now(timezone.utc)
+    _write_heartbeat(tmp_path, now.isoformat())
+    fr.emit_staleness_banner(tmp_path, max_age_mins=180)
+    out = capsys.readouterr().out
+    assert "STALE DATA" not in out
+
+
+def test_missing_heartbeat_no_crash_no_banner(tmp_path, capsys):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    fr.emit_staleness_banner(tmp_path, max_age_mins=180)
+    out = capsys.readouterr().out
+    assert "STALE DATA" not in out
+
+
+def test_malformed_ts_no_crash_no_banner(tmp_path, capsys):
+    _write_heartbeat(tmp_path, "not-a-timestamp")
+    fr.emit_staleness_banner(tmp_path, max_age_mins=180)
+    out = capsys.readouterr().out
+    assert "STALE DATA" not in out
 
 # --- real captured output ---------------------------------------------------
 
