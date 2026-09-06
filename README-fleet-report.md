@@ -106,14 +106,21 @@ unparsed is reported loudly rather than defaulted to `CURRENT`.
 
 `--no-sweep` is the **consumer-side view**: it serves the last sweep's stored
 report from the state dir and labels it with a `STALE DATA` banner when the
-state dir's heartbeat is older than `--max-age-mins` (default 180). This is
+**stored verdicts** are older than `--max-age-mins` (default 180). This is
 the banner's only home.
+
+Age comes from the timestamp the sweep stamps **inside
+`state/fleet-verdicts.json`** (`{"ts": ..., "results": [...]}`), with the
+file's mtime as the fallback for stores written before that shape existed.
+The heartbeat is never consulted for staleness: it is a liveness
+side-channel and can be missing (or stale) while the verdicts it vouched
+for are a day old — exactly the 2026-09-03 incident class.
 
 The banner originally sat at the top of `main()`, *before* the sweep — so it
 always read the **previous** run's heartbeat (~24 h old in the nightly cron)
-and fired on fresh data every single night. A guard that cries wolf nightly is
-worse than none. Moving it after the sweep would be no better: the sweep
-unconditionally writes a fresh heartbeat when it finishes (probing never
+and fired on fresh data every single night. A guard that cries wolf nightly
+is worse than none. Moving it after the sweep would be no better: the sweep
+unconditionally writes a fresh timestamp when it finishes (probing never
 raises), so a post-sweep banner would read an age of zero forever — an
 unreachable guard is guard deletion. So:
 
@@ -124,7 +131,20 @@ unreachable guard is guard deletion. So:
 
 `--no-sweep` is read-only: no probing, no state writes. Missing stored
 verdicts are a visible failure (`exit 1`, message on stderr), never silence.
-With `--json`, stdout stays valid JSON and the banner goes to stderr.
+A malformed store (wrong shape, or elements missing `name`/`verdict`) is
+likewise a one-line stderr message, never a traceback.
+
+**Exit codes for `--no-sweep`:**
+
+| rc | meaning |
+|---|---|
+| 0 | stored report served, fresher than `--max-age-mins` |
+| 1 | nothing to serve, or the store is unreadable/malformed |
+| 2 | stored report served **but stale** — re-run a sweep before trusting it |
+
+With `--json`, stdout stays valid JSON and the banner goes to stderr; the
+staleness signal for JSON consumers is **`rc=2`**, since a pipe consumer of
+stdout never sees stderr.
 
 ## Cron mode and the silence contract
 
@@ -163,7 +183,7 @@ it with a deadman check that speaks when the heartbeat ages past ~26h.
 ## Tests
 
 ```bash
-python3 -m pytest tests/ -q      # 32 tests
+python3 -m pytest tests/ -q      # 42 tests
 ```
 
 Fixtures are real captured output, not invented strings. Tests named

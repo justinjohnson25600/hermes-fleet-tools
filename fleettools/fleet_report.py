@@ -317,39 +317,117 @@ def load_roster(path: str | None) -> dict:
     sys.exit("fleet_report: no roster found (set FLEET_ROSTER or pass --roster)")
 
 
-def emit_staleness_banner(state_dir, max_age_mins=180, stream=None):
-    """Print a STALE DATA banner when the sweep heartbeat is older than max_age_mins.
+VERDICTS_FILENAME = "fleet-verdicts.json"
+HEARTBEAT_FILENAME = "fleet-heartbeat.json"
 
-    The 2026-09-03 incident: a 5.6h-old fleet-heartbeat.json was served as a
-    current status because nothing on the report's face carried its age. The
-    banner is printed to STDOUT (the quiet-watchdog contract: stdout IS the
-    human channel; this is warranted signal, not noise) alongside the normal
-    table - stale data must be labelled, never suppressed.
 
-    Fail-open by design on unknowable age (no heartbeat file, unparseable ts,
-    unreadable dir): an unknown age is not a false one. That condition has a
-    different owner (the deadman cron) and must not cry wolf here.
+def _atomic_write_json(path: Path, obj) -> None:
+    """Write JSON so a crash never leaves a torn or stale-but-paired file.
+
+    A plain write_text truncates the file first: a crash mid-write leaves a
+    zero-byte store that looks exactly like 'no verdicts'. tempfile + rename
+    is atomic on POSIX and Windows: readers see the old file or the new one,
+    never a half-written one.
     """
-    import sys as _sys
-    out = stream if stream is not None else _sys.stdout
+    import tempfile
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name, suffix=".tmp")
     try:
-        hb_path = Path(state_dir) / "fleet-heartbeat.json"
-        raw = json.loads(hb_path.read_text(encoding="utf-8"))
-        ts = datetime.fromisoformat(str(raw.get("ts", "")))
-    except (OSError, ValueError, json.JSONDecodeError):
-        return
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=timezone.utc)
-    age_h = (datetime.now(timezone.utc) - ts).total_seconds() / 3600.0
-    if age_h * 60 <= max_age_mins:
-        return
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(obj, fh, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def load_stored_verdicts(path: Path) -> tuple[list[dict], str | None]:
+    """Read a fleet-verdicts.json in EITHER the current or the legacy shape.
+
+    Current (written since the ts-inside-the-store fix): ``{"ts": ...,
+    "results": [...]}`` — the store carries its own sweep timestamp. Legacy
+    (a bare list) has no embedded ts; the caller falls back to file mtime.
+
+    Raises ValueError with a one-line, human-readable message on any shape
+    problem, including elements that are not dicts carrying 'name' and
+    'verdict' — a store like ``["a", "b"]`` must die as a clean error line,
+    never a KeyError traceback after the table header.
+    """
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(raw, dict):
+        results, ts = raw.get("results"), raw.get("ts")
+    else:
+        results, ts = raw, None
+    if not isinstance(results, list) or not results:
+        raise ValueError("not a non-empty list of results")
+    for r in results:
+        if not isinstance(r, dict) or "name" not in r or "verdict" not in r:
+            raise ValueError(
+                "results[...] must be objects with 'name' and 'verdict' fields")
+    return results, ts if isinstance(ts, str) else None
+
+
+def verdicts_age_h(state_dir: Path) -> float | None:
+    """Age of the SERVED verdicts, in hours; None when unknowable.
+
+    The sweep stamps its timestamp INSIDE fleet-verdicts.json, so the file
+    a consumer serves labels itself — a state dir whose heartbeat was lost
+    or never written can no longer pass as fresh (the 2026-09-03 incident
+    class: the banner used to age the heartbeat while serving the verdicts).
+    Embedded ts is authoritative; file mtime is the fallback for legacy
+    stores. Unknowable age returns None — unknown is not false.
+    """
+    vpath = Path(state_dir) / VERDICTS_FILENAME
+    try:
+        ts = None
+        try:
+            _, ts = load_stored_verdicts(vpath)
+        except (OSError, ValueError):
+            pass
+        if ts is not None:
+            stamped = datetime.fromisoformat(ts)
+            if stamped.tzinfo is None:
+                stamped = stamped.replace(tzinfo=timezone.utc)
+            return max(0.0, (datetime.now(timezone.utc) - stamped).total_seconds() / 3600.0)
+        return max(0.0, (datetime.now(timezone.utc).timestamp() - vpath.stat().st_mtime) / 3600.0)
+    except (OSError, ValueError):
+        return None
+
+
+def emit_staleness_banner(state_dir, max_age_mins=180, stream=None,
+                          age_h: float | None = None) -> bool:
+    """Print a STALE DATA banner when the served verdicts are older than max_age_mins.
+
+    The 2026-09-03 incident: a 5.6h-old sweep was served as a current status
+    because nothing on the report's face carried its age. The banner is
+    printed to STDOUT (the quiet-watchdog contract: stdout IS the human
+    channel; this is warranted signal, not noise) alongside the normal table
+    — stale data must be labelled, never suppressed.
+
+    Returns True iff the banner fired, so callers can turn staleness into an
+    exit code (JSON consumers cannot see stderr). Fail-open by design on
+    unknowable age (no file, unparseable ts, unreadable dir): an unknown age
+    is not a false one. That condition has a different owner (the deadman
+    cron) and must not cry wolf here.
+    """
+    out = stream if stream is not None else sys.stdout
+    if age_h is None:
+        age_h = verdicts_age_h(state_dir)
+    if age_h is None or age_h * 60 <= max_age_mins:
+        return False
     print(
         "STALE DATA: sweep is %.1f h old — re-run before trusting these numbers" % age_h,
         file=out,
     )
+    return True
 
 
-def render_report(results: list[dict], state_dir: Path, quiet: bool = False) -> int:
+def render_report(results: list[dict], state_dir: Path, quiet: bool = False,
+                  served_ts: str | None = None) -> int:
     """Print the human report for `results` — live from a sweep, or stored."""
     problems = [r for r in results if r.get("verdict") in PROBLEM_VERDICTS]
     if quiet:
@@ -378,8 +456,16 @@ def render_report(results: list[dict], state_dir: Path, quiet: bool = False) -> 
               f"{(r.get('reasons') or [''])[0]}")
         for reason in (r.get("reasons") or [])[1:]:
             print(f"{' ' * (width + 44)}{reason}")
-    print(f"\n{len(problems)} of {len(results)} agents need attention. "
-          f"heartbeat -> {state_dir / 'fleet-heartbeat.json'}")
+    if served_ts is None:
+        # Producer (sweep) mode: this run wrote the state the next consumer
+        # will serve, so point at the store it just refreshed.
+        print(f"\n{len(problems)} of {len(results)} agents need attention. "
+              f"store -> {state_dir / VERDICTS_FILENAME}")
+    else:
+        # Consumer (--no-sweep) mode: nothing was written; report exactly
+        # what is being served, with the sweep timestamp it was stamped with.
+        print(f"\n{len(problems)} of {len(results)} agents need attention. "
+              f"served from {state_dir / VERDICTS_FILENAME} (sweep ts {served_ts})")
     return 0
 
 
@@ -398,11 +484,13 @@ def serve_stored_state(args) -> int:
       which is fresh by construction (probe() never raises, so the write is
       unconditional) — an unreachable guard is guard deletion.
 
-    So: the producer (sweep) never banners; the consumer (--no-sweep)
-    labels exactly what it serves. Never probes, never writes state.
+    Age comes from the ts the sweep stamps INSIDE fleet-verdicts.json
+    (embedded ts first, file mtime fallback for legacy stores) — never from
+    the heartbeat, which is a liveness side-channel and can be missing while
+    the verdicts it vouches for are a day old (2026-09-03 incident class).
     """
     state_dir = Path(args.state)
-    prev_path = state_dir / "fleet-verdicts.json"
+    prev_path = state_dir / VERDICTS_FILENAME
     if not prev_path.is_file():
         # Nothing to serve is a visible failure, never silence: a missing
         # report must not look like an all-clear fleet.
@@ -410,24 +498,31 @@ def serve_stored_state(args) -> int:
               file=sys.stderr)
         return 1
     try:
-        results = json.loads(prev_path.read_text(encoding="utf-8"))
-        if not isinstance(results, list) or not results:
-            raise ValueError("not a non-empty list of results")
+        results, served_ts = load_stored_verdicts(prev_path)
     except (OSError, ValueError) as exc:
         print(f"fleet_report: stored verdicts unreadable ({exc})", file=sys.stderr)
         return 1
 
+    # A stored report is a replay, not a live observation: 'changed'/'previous_verdict'
+    # were computed against the state of the world one sweep ago and must not be
+    # re-announced as if they just happened.
+    for r in results:
+        r.pop("changed", None)
+        r.pop("previous_verdict", None)
+
     # Staleness first, before any table, so a reader can never mistake an
     # old sweep for a current one (2026-09-03). Unconditional w.r.t. --quiet:
     # stale data is signal. In --json mode stdout must stay valid JSON, so
-    # the banner goes to stderr there.
-    emit_staleness_banner(state_dir, max_age_mins=args.max_age_mins,
-                          stream=sys.stderr if args.json else sys.stdout)
+    # the banner goes to stderr there — and staleness also becomes rc=2,
+    # because rc is the only channel a JSON consumer reliably reads.
+    bannered = emit_staleness_banner(
+        state_dir, max_age_mins=args.max_age_mins,
+        stream=sys.stderr if args.json else sys.stdout)
 
     if args.json:
         print(json.dumps(results, indent=2))
-        return 0
-    return render_report(results, state_dir, quiet=args.quiet)
+        return 2 if bannered else 0
+    return render_report(results, state_dir, quiet=args.quiet, served_ts=served_ts)
 
 
 def main() -> int:
@@ -445,7 +540,7 @@ def main() -> int:
                          "and label it with the STALE DATA banner if old; no probing, "
                          "no state writes")
     ap.add_argument("--max-age-mins", type=int, default=180,
-                    help="STALE DATA banner threshold on the heartbeat's age (default 180)")
+                    help="STALE DATA threshold on the stored verdicts' age (default 180)")
     args = ap.parse_args()
 
     if args.no_sweep:
@@ -469,12 +564,15 @@ def main() -> int:
 
     state_dir = Path(args.state)
     state_dir.mkdir(parents=True, exist_ok=True)
-    prev_path = state_dir / "fleet-verdicts.json"
+    prev_path = state_dir / VERDICTS_FILENAME
     previous = {}
     if prev_path.is_file():
         try:
-            previous = {r["name"]: r for r in json.loads(prev_path.read_text())}
-        except (ValueError, KeyError):
+            # Both shapes: current {"ts":..., "results":[...]} and the legacy
+            # bare list written before the ts-inside-the-store fix.
+            prev_results, _ = load_stored_verdicts(prev_path)
+            previous = {r["name"]: r for r in prev_results}
+        except (OSError, ValueError, KeyError):
             previous = {}
 
     changed, problems = [], []
@@ -487,16 +585,24 @@ def main() -> int:
         if r["verdict"] in PROBLEM_VERDICTS:
             problems.append(r)
 
+    sweep_ts = datetime.now(timezone.utc).isoformat()
+    # Verdicts FIRST, heartbeat second: the heartbeat is the liveness beacon
+    # for a deadman switch, so it must only proclaim life after the store it
+    # vouches for is durable on disk. A crash between the two writes then
+    # leaves an ageing heartbeat over stale verdicts — visible — instead of
+    # a fresh heartbeat over stale verdicts, which is a lie. Both writes are
+    # temp-file + os.replace, so a crash mid-write can never tear a file.
+    _atomic_write_json(prev_path, {"ts": sweep_ts, "results": results})
+
     heartbeat = {
-        "ts": datetime.now(timezone.utc).isoformat(),
+        "ts": sweep_ts,
         "agents_total": len(results),
         "verdicts": {r["name"]: r["verdict"] for r in results},
         "heads": {r["name"]: r["head"] for r in results},
         "problems": [r["name"] for r in problems],
         "changed": [r["name"] for r in changed],
     }
-    (state_dir / "fleet-heartbeat.json").write_text(json.dumps(heartbeat, indent=2))
-    prev_path.write_text(json.dumps(results, indent=2))
+    _atomic_write_json(state_dir / HEARTBEAT_FILENAME, heartbeat)
 
     if args.json:
         print(json.dumps(results, indent=2))
