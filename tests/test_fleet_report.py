@@ -14,6 +14,7 @@ import re
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -73,6 +74,115 @@ def test_malformed_ts_no_crash_no_banner(tmp_path, capsys):
     fr.emit_staleness_banner(tmp_path, max_age_mins=180)
     out = capsys.readouterr().out
     assert "STALE DATA" not in out
+
+
+# ---------------------------------------------------------------------------
+# WHERE the banner lives. Observed in production 09-05 and 09-06: the banner
+# was producer-side, called at the top of main() BEFORE the sweep -- so it
+# always read the PREVIOUS run's heartbeat (~24h old in the nightly cron)
+# and fired on fresh data every night. A guard that cries wolf nightly is
+# worse than none. But post-sweep placement is not the fix either: main()
+# unconditionally writes a fresh heartbeat after the sweep (probe() never
+# raises), so a post-sweep banner would be unreachable forever -- guard
+# deletion. The banner is consumer-side: --no-sweep is the read-only
+# interactive view of the state dir, and it labels what it serves.
+# ---------------------------------------------------------------------------
+
+HEALTHY_RESULT = {
+    "name": "box-a", "verdict": "CURRENT", "reasons": [],
+    "head": "26f178e5fa78", "upstream": "26f178e5fa78",
+    "behind": 0, "ahead": 0, "stashes": 0, "dirty": 0,
+    "shallow": False, "desktop_running": False, "version": "v0.0.0",
+    "carried_claim": None, "check_raw": "", "error": None,
+}
+
+
+def _write_state(tmp_path, ts_iso, results=None):
+    """A state dir as the nightly leaves it: heartbeat + last verdicts."""
+    state = tmp_path / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    (state / "fleet-heartbeat.json").write_text(
+        json.dumps({"ts": ts_iso, "agents_total": 1,
+                    "verdicts": {"box-a": "CURRENT"}}, indent=2),
+        encoding="utf-8")
+    (state / "fleet-verdicts.json").write_text(
+        json.dumps(results or [HEALTHY_RESULT], indent=2), encoding="utf-8")
+    return state
+
+
+def _write_roster(tmp_path):
+    roster = tmp_path / "agents.json"
+    roster.write_text(json.dumps({"agents": [
+        {"name": "box-a", "host": "local", "platform": "macos",
+         "enabled": True, "cli": "/usr/bin/true"}]}), encoding="utf-8")
+    return roster
+
+
+def _run_main(argv):
+    with mock.patch.object(sys, "argv", argv):
+        return fr.main()
+
+
+def test_sweep_never_banners_even_on_day_old_previous_heartbeat(
+        tmp_path, capsys):
+    """THE NIGHTLY DEFECT (09-05, 09-06): the sweep path read the previous
+    run's ~24h-old heartbeat and stamped STALE DATA on data it had swept
+    moments earlier. The sweep writes its own fresh heartbeat, so its
+    output is fresh by construction and must NEVER carry the banner."""
+    day_old = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    state = _write_state(tmp_path, day_old)
+    roster = _write_roster(tmp_path)
+    with mock.patch.object(fr, "probe", return_value=dict(HEALTHY_RESULT)):
+        rc = _run_main(["fleet_report.py", "--roster", str(roster),
+                        "--state", str(state)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "STALE DATA" not in out, (
+        "cry-wolf: the sweep path bannered over its own fresh output")
+    # and the sweep proved liveness: fresh heartbeat on disk
+    hb = json.loads((state / "fleet-heartbeat.json").read_text())
+    age_h = (datetime.now(timezone.utc)
+             - datetime.fromisoformat(hb["ts"])).total_seconds() / 3600
+    assert age_h < 1 / 60
+
+
+def test_no_sweep_on_day_old_state_dir_prints_banner(tmp_path, capsys):
+    """--no-sweep is the banner's only home: an interactive read of a stale
+    state dir must carry its age (the 2026-09-03 incident class)."""
+    day_old = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    state = _write_state(tmp_path, day_old)
+    before = (state / "fleet-heartbeat.json").read_text()
+    rc = _run_main(["fleet_report.py", "--no-sweep", "--state", str(state)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "STALE DATA" in out and "24" in out
+    assert "box-a" in out, "the stored report itself is still printed"
+    # read-only: nothing in the state dir may change
+    assert (state / "fleet-heartbeat.json").read_text() == before
+
+
+def test_no_sweep_on_fresh_state_dir_prints_no_banner(tmp_path, capsys):
+    state = _write_state(tmp_path, datetime.now(timezone.utc).isoformat())
+    rc = _run_main(["fleet_report.py", "--no-sweep", "--state", str(state)])
+    assert rc == 0
+    assert "STALE DATA" not in capsys.readouterr().out
+
+
+def test_no_sweep_missing_state_dir_no_crash_no_banner(tmp_path, capsys):
+    rc = _run_main(["fleet_report.py", "--no-sweep",
+                    "--state", str(tmp_path / "nothere")])
+    assert "STALE DATA" not in capsys.readouterr().out
+    assert rc == 1, "nothing to serve must be a visible failure, not silence"
+
+
+def test_no_sweep_malformed_heartbeat_no_crash_no_banner(tmp_path, capsys):
+    """Age unknowable is not age false: fail open, serve the stored report."""
+    state = _write_state(tmp_path, "not-a-timestamp")
+    rc = _run_main(["fleet_report.py", "--no-sweep", "--state", str(state)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "STALE DATA" not in out and "box-a" in out
+
 
 # --- real captured output ---------------------------------------------------
 

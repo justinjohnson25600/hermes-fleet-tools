@@ -349,6 +349,87 @@ def emit_staleness_banner(state_dir, max_age_mins=180, stream=None):
     )
 
 
+def render_report(results: list[dict], state_dir: Path, quiet: bool = False) -> int:
+    """Print the human report for `results` — live from a sweep, or stored."""
+    problems = [r for r in results if r.get("verdict") in PROBLEM_VERDICTS]
+    if quiet:
+        speak = ([r for r in results if r.get("changed")]
+                 + [r for r in problems if not r.get("changed")])
+        if not speak:
+            return 0                      # all-clear is silent, by contract
+        print("FLEET DRIFT REPORT — attention required\n")
+        for r in speak:
+            arrow = f"  (was {r.get('previous_verdict')})" if r.get("changed") else ""
+            print(f"  {r['name']:18} {r['verdict']}{arrow}")
+            for reason in r.get("reasons") or []:
+                print(f"      - {reason}")
+        return 0
+
+    width = max(len(r["name"]) for r in results)
+    print(f"{'agent'.ljust(width)}  {'verdict':11} {'head':13} {'behind':>6} {'ahead':>5} "
+          f"{'stash':>5} {'dirty':>5}  notes")
+    print("-" * (width + 78))
+    for r in sorted(results, key=lambda x: (x["verdict"] not in PROBLEM_VERDICTS, x["name"])):
+        print(f"{r['name'].ljust(width)}  {r['verdict']:11} {r['head'] or '-':13} "
+              f"{str(r['behind']) if r['behind'] is not None else '-':>6} "
+              f"{str(r['ahead']) if r['ahead'] is not None else '-':>5} "
+              f"{str(r['stashes']) if r['stashes'] is not None else '-':>5} "
+              f"{str(r['dirty']) if r['dirty'] is not None else '-':>5}  "
+              f"{(r.get('reasons') or [''])[0]}")
+        for reason in (r.get("reasons") or [])[1:]:
+            print(f"{' ' * (width + 44)}{reason}")
+    print(f"\n{len(problems)} of {len(results)} agents need attention. "
+          f"heartbeat -> {state_dir / 'fleet-heartbeat.json'}")
+    return 0
+
+
+def serve_stored_state(args) -> int:
+    """--no-sweep: read-only interactive view of the state dir.
+
+    Serves the LAST sweep's stored verdicts and labels them with the STALE
+    DATA banner when the state dir's heartbeat is old. This is the banner's
+    only home. It cannot live in the sweep path:
+
+    * BEFORE the sweep (where it sat since b08a4f8) it reads the PREVIOUS
+      run's heartbeat — ~24h old in the nightly cron — so the banner fired
+      on fresh data every single night (production output 09-05, 09-06).
+      A guard that cries wolf nightly is worse than none.
+    * AFTER the sweep it would read the heartbeat the same run just wrote,
+      which is fresh by construction (probe() never raises, so the write is
+      unconditional) — an unreachable guard is guard deletion.
+
+    So: the producer (sweep) never banners; the consumer (--no-sweep)
+    labels exactly what it serves. Never probes, never writes state.
+    """
+    state_dir = Path(args.state)
+    prev_path = state_dir / "fleet-verdicts.json"
+    if not prev_path.is_file():
+        # Nothing to serve is a visible failure, never silence: a missing
+        # report must not look like an all-clear fleet.
+        print(f"fleet_report: no stored verdicts in {state_dir} — run a sweep first",
+              file=sys.stderr)
+        return 1
+    try:
+        results = json.loads(prev_path.read_text(encoding="utf-8"))
+        if not isinstance(results, list) or not results:
+            raise ValueError("not a non-empty list of results")
+    except (OSError, ValueError) as exc:
+        print(f"fleet_report: stored verdicts unreadable ({exc})", file=sys.stderr)
+        return 1
+
+    # Staleness first, before any table, so a reader can never mistake an
+    # old sweep for a current one (2026-09-03). Unconditional w.r.t. --quiet:
+    # stale data is signal. In --json mode stdout must stay valid JSON, so
+    # the banner goes to stderr there.
+    emit_staleness_banner(state_dir, max_age_mins=args.max_age_mins,
+                          stream=sys.stderr if args.json else sys.stdout)
+
+    if args.json:
+        print(json.dumps(results, indent=2))
+        return 0
+    return render_report(results, state_dir, quiet=args.quiet)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Report update-drift across the fleet (read-only).")
     ap.add_argument("--roster")
@@ -359,13 +440,16 @@ def main() -> int:
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--quiet", action="store_true",
                     help="print only changes and problems; silence means all-clear")
+    ap.add_argument("--no-sweep", action="store_true",
+                    help="read-only: serve the last sweep's stored report from --state "
+                         "and label it with the STALE DATA banner if old; no probing, "
+                         "no state writes")
     ap.add_argument("--max-age-mins", type=int, default=180,
                     help="STALE DATA banner threshold on the heartbeat's age (default 180)")
     args = ap.parse_args()
 
-    # Staleness first: label stale data on the report's face BEFORE any table,
-    # so a reader can never mistake an old sweep for a current one (2026-09-03).
-    emit_staleness_banner(args.state, max_age_mins=args.max_age_mins)
+    if args.no_sweep:
+        return serve_stored_state(args)
 
     roster = load_roster(args.roster)
     agents = [a for a in roster.get("agents", []) if a.get("enabled")]
@@ -418,34 +502,7 @@ def main() -> int:
         print(json.dumps(results, indent=2))
         return 0
 
-    if args.quiet:
-        speak = changed + [r for r in problems if not r["changed"]]
-        if not speak:
-            return 0                      # all-clear is silent, by contract
-        print("FLEET DRIFT REPORT — attention required\n")
-        for r in speak:
-            arrow = f"  (was {r['previous_verdict']})" if r["changed"] else ""
-            print(f"  {r['name']:18} {r['verdict']}{arrow}")
-            for reason in r["reasons"]:
-                print(f"      - {reason}")
-        return 0
-
-    width = max(len(r["name"]) for r in results)
-    print(f"{'agent'.ljust(width)}  {'verdict':11} {'head':13} {'behind':>6} {'ahead':>5} "
-          f"{'stash':>5} {'dirty':>5}  notes")
-    print("-" * (width + 78))
-    for r in sorted(results, key=lambda x: (x["verdict"] not in PROBLEM_VERDICTS, x["name"])):
-        print(f"{r['name'].ljust(width)}  {r['verdict']:11} {r['head'] or '-':13} "
-              f"{str(r['behind']) if r['behind'] is not None else '-':>6} "
-              f"{str(r['ahead']) if r['ahead'] is not None else '-':>5} "
-              f"{str(r['stashes']) if r['stashes'] is not None else '-':>5} "
-              f"{str(r['dirty']) if r['dirty'] is not None else '-':>5}  "
-              f"{r['reasons'][0] if r['reasons'] else ''}")
-        for reason in r["reasons"][1:]:
-            print(f"{' ' * (width + 44)}{reason}")
-    print(f"\n{len(problems)} of {len(results)} agents need attention. "
-          f"heartbeat -> {state_dir / 'fleet-heartbeat.json'}")
-    return 0
+    return render_report(results, state_dir, quiet=args.quiet)
 
 
 if __name__ == "__main__":

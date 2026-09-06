@@ -77,6 +77,8 @@ you which one is real.
 fleet_report.py                      # full table
 fleet_report.py --quiet              # only changes + problems (cron mode)
 fleet_report.py --json               # machine-readable
+fleet_report.py --no-sweep           # read-only: serve the last sweep's stored
+                                     # report, banner it if the state dir is old
 fleet_report.py --workers 1          # fully serialised, gentlest on rate limits
 fleet_report.py --state ./state      # where the heartbeat + last verdicts live
 ```
@@ -99,6 +101,30 @@ once is enough to get rate-limited.
 **`UNKNOWN` is a first-class verdict, not an error path.** The whole failure mode
 this tool defends against is silence being mistaken for health, so anything
 unparsed is reported loudly rather than defaulted to `CURRENT`.
+
+## STALE DATA banner and the cry-wolf fix
+
+`--no-sweep` is the **consumer-side view**: it serves the last sweep's stored
+report from the state dir and labels it with a `STALE DATA` banner when the
+state dir's heartbeat is older than `--max-age-mins` (default 180). This is
+the banner's only home.
+
+The banner originally sat at the top of `main()`, *before* the sweep — so it
+always read the **previous** run's heartbeat (~24 h old in the nightly cron)
+and fired on fresh data every single night. A guard that cries wolf nightly is
+worse than none. Moving it after the sweep would be no better: the sweep
+unconditionally writes a fresh heartbeat when it finishes (probing never
+raises), so a post-sweep banner would read an age of zero forever — an
+unreachable guard is guard deletion. So:
+
+- **the producer** (a normal sweep run) never banners — its own output is
+  fresh by construction;
+- **the consumer** (`--no-sweep`) labels exactly what it serves, including
+  when it is old.
+
+`--no-sweep` is read-only: no probing, no state writes. Missing stored
+verdicts are a visible failure (`exit 1`, message on stderr), never silence.
+With `--json`, stdout stays valid JSON and the banner goes to stderr.
 
 ## Cron mode and the silence contract
 
@@ -137,7 +163,7 @@ it with a deadman check that speaks when the heartbeat ages past ~26h.
 ## Tests
 
 ```bash
-python3 -m pytest tests/ -q      # 21 tests
+python3 -m pytest tests/ -q      # 32 tests
 ```
 
 Fixtures are real captured output, not invented strings. Tests named
