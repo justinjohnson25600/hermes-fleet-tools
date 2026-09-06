@@ -42,8 +42,10 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Optional
 
 # --------------------------------------------------------------------------
 # Remote payloads. Shipped base64/-EncodedCommand so no quoting survives three
@@ -321,29 +323,125 @@ VERDICTS_FILENAME = "fleet-verdicts.json"
 HEARTBEAT_FILENAME = "fleet-heartbeat.json"
 
 
-# The full per-record key set render_report() reads unconditionally. ONE
-# tuple feeds BOTH the store validator (load_stored_verdicts) and the
-# renderer, so the two can never drift apart again: round 2 found the
-# validator checking only name/verdict while render indexed head/behind/
-# ahead/stashes/dirty, so a minimal record {"name": ..., "verdict": ...}
-# passed validation and died with KeyError 'head' AFTER the banner.
-RENDER_REQUIRED_KEYS = ("name", "verdict", "head", "behind", "ahead",
-                        "stashes", "dirty")
+# --------------------------------------------------------------------------
+# The typed record every consumer of a stored store renders from.
+#
+# Round 3 closed the class, not another instance: rounds 1 and 2 kept a
+# key-PRESENCE validator next to a renderer that indexes those keys, and the
+# third drift (a stored record with verdict:null passing presence checks and
+# dying in render with a TypeError AFTER the banner) proved presence and type
+# are two different contracts that must live in ONE place. They do now: a
+# record read by load_stored_verdicts becomes a StoredVerdict whose fields
+# ARE the render schema, typed, checked once at construction. render_report
+# indexes attributes; a wrong type or a missing field raises here, at load,
+# naming the field — before any banner is printed, so the caller's
+# except-clause turns it into the one-line unreadable-store message.
+#
+# The record deliberately also carries the soft render inputs (reasons,
+# changed, previous_verdict): constructing it from ANY stored dict that
+# renders cleanly means construction cannot introduce a new after-the-banner
+# crash class, which a name-only record would.
+# --------------------------------------------------------------------------
+@dataclass
+class StoredVerdict:
+    """One stored agent record, validated once, rendered everywhere."""
 
-# Text-table columns in print order: (key, width, label, right-align). The
-# renderer builds its header and rows FROM this spec, and the assert below
-# welds it to RENDER_REQUIRED_KEYS: add a column the table renders without
-# adding its key to the validated set (or vice versa) and import fails —
-# the drift that caused the round-2 KeyError becomes impossible.
-_RENDER_COLUMNS = (
-    ("head",    13, "head",   False),
-    ("behind",   6, "behind", True),
-    ("ahead",    5, "ahead",  True),
-    ("stashes",  5, "stash",  True),
-    ("dirty",    5, "dirty",  True),
-)
-assert {c[0] for c in _RENDER_COLUMNS} | {"name", "verdict"} == set(
-    RENDER_REQUIRED_KEYS), "render columns and validated keys drifted apart"
+    name: str
+    verdict: str
+    head: str
+    behind: Optional[int]
+    ahead: Optional[int]
+    stashes: Optional[int]
+    dirty: Optional[int]
+    reasons: list = field(default_factory=list)
+    changed: bool = False
+    previous_verdict: Optional[str] = None
+    extra: dict = field(default_factory=dict)
+
+    def __init__(self, index, raw):
+        """Validate raw (a decoded JSON record) into typed fields.
+
+        Raises ValueError with a one-line message naming the field and the
+        problem, exactly like the previous key-presence validator did — so
+        callers' except ValueError handling is unchanged.
+        """
+        where = f"results[{index}]"
+        if not isinstance(raw, dict):
+            raise ValueError(
+                f"{where} must be an object, not {type(raw).__name__}")
+        self.extra = {k: v for k, v in raw.items()}
+
+        def take(field_name: str, want, allow_missing: bool = False) -> Any:
+            if field_name not in raw:
+                if allow_missing:
+                    return None
+                raise ValueError(f"{where} is missing field '{field_name}' "
+                                 f"the report renders")
+            v = raw[field_name]
+            # The numeric fields are int|None by contract: the producer emits
+            # null counts whenever git cannot answer (UNREACHABLE, UNKNOWN),
+            # so None is ACCEPTED there and rendered as '-'. A bool is refused
+            # even though it subclasses int — dirty:true is a type error, not
+            # a count — and a numeric string is accepted from a hand-edited
+            # store. String fields must be real strings.
+            if want is int:
+                if v is None:
+                    return None
+                if isinstance(v, bool):
+                    ok = False
+                elif isinstance(v, int):
+                    ok = True
+                elif isinstance(v, str) and v.strip().isdigit():
+                    v = int(v)
+                    ok = True
+                else:
+                    ok = False
+            else:
+                ok = isinstance(v, want) and not isinstance(v, bool)
+            if not ok:
+                raise ValueError(
+                    f"{where}.{field_name} must be "
+                    f"{'an integer or null' if want is int else _typename(want)}, "
+                    f"not {json.dumps(v)[:60]} ({type(v).__name__})")
+            return v
+
+        self.name = take("name", str)
+        if not self.name:
+            raise ValueError(f"{where}.name must be a non-empty string")
+        self.verdict = take("verdict", str)
+        self.head = take("head", str)
+        self.behind = take("behind", int)
+        self.ahead = take("ahead", int)
+        self.stashes = take("stashes", int)
+        self.dirty = take("dirty", int)
+        reasons = raw.get("reasons") or []
+        if not isinstance(reasons, list) or any(
+                not isinstance(x, str) for x in reasons):
+            raise ValueError(f"{where}.reasons must be a list of strings")
+        self.reasons = list(reasons)
+        self.changed = bool(raw.get("changed", False))
+        previous = raw.get("previous_verdict")
+        if previous is not None and not isinstance(previous, str):
+            raise ValueError(f"{where}.previous_verdict must be a string or null")
+        self.previous_verdict = previous
+
+    def as_dict(self):
+        """The full record for --json output: validated fields first, then
+        any extra keys the producer wrote, preserving them verbatim."""
+        d = {k: v for k, v in self.extra.items()}
+        d.update({
+            "name": self.name, "verdict": self.verdict, "head": self.head,
+            "behind": self.behind, "ahead": self.ahead,
+            "stashes": self.stashes, "dirty": self.dirty,
+            "reasons": self.reasons, "changed": self.changed,
+            "previous_verdict": self.previous_verdict,
+        })
+        return d
+
+
+def _typename(want) -> str:
+    return {str: "a string", int: "an integer", list: "a list"}.get(
+        want, getattr(want, "__name__", str(want)))
 
 
 def _atomic_write_json(path: Path, obj) -> None:
@@ -380,36 +478,85 @@ def _atomic_write_json(path: Path, obj) -> None:
         raise
 
 
-def load_stored_verdicts(path: Path) -> tuple[list[dict], str | None]:
-    """Read a fleet-verdicts.json in EITHER the current or the legacy shape.
+def _read_store_fd(path: Path):
+    """Open the store once and return (decoded JSON, mtime from the SAME fd).
 
-    Current (written since the ts-inside-the-store fix): ``{"ts": ...,
+    Round 3 TOCTOU: load_stored_verdicts used to read the bytes with
+    read_text() and then call path.stat() — two separate opens. On a legacy
+    bare-list store (the only shape with no embedded ts, so the only shape
+    whose age comes from mtime) a sweep could land between the two: the reader
+    holds the OLD bytes but stats the NEW file, pairs old data with a fresh
+    mtime, computes age 0, and serves a day-old report with no banner.
+    os.open + os.fstat + read on one descriptor makes the pairing airtight:
+    the fstat sees whatever inode the open() resolved to, and reading from
+    that same fd reads exactly that inode — bytes and mtime provably describe
+    the same file, whatever lands on the path meanwhile.
+    """
+    fd = os.open(str(path), os.O_RDONLY)
+    try:
+        st = os.fstat(fd)
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
+    return json.loads(b"".join(chunks).decode("utf-8")), st.st_mtime
+
+
+def load_stored_verdicts(path: Path) -> tuple[list, str | None, float]:
+    """Read a fleet-verdicts.json ONCE; return (records, ts, mtime).
+
+    Works with EITHER the current or the legacy store shape. Current
+    (written since the ts-inside-the-store fix): ``{"ts": ...,
     "results": [...]}`` — the store carries its own sweep timestamp. Legacy
     (a bare list) has no embedded ts; the caller falls back to file mtime.
 
-    Raises ValueError with a one-line, human-readable message on any shape
-    problem. Records are validated against RENDER_REQUIRED_KEYS — the same
-    tuple render_report() consumes — so anything that would die as a KeyError
-    traceback after the banner dies here as a clean error line instead.
+    The bytes AND the mtime come from a single open file description
+    (see _read_store_fd) — the mtime provably describes the exact bytes
+    returned, whatever lands on the path during the call. Round 3: this
+    used to be read_text() followed by path.stat(), so a sweep landing
+    between them served old bytes paired with a fresh mtime — age 0, no
+    banner — and the legacy bare-list shape (mtime is its ONLY age source)
+    was exactly the shape that race bit.
+
+    Every record is validated ONCE into a StoredVerdict (typed fields for
+    everything the report renders). Wrong shape, missing keys, or wrong types
+    (a null verdict, a numeric head) raise ValueError here with a one-line
+    message naming the field — BEFORE any banner or table — instead of dying
+    as a KeyError/TypeError traceback after it.
     """
-    raw = json.loads(path.read_text(encoding="utf-8"))
-    if isinstance(raw, dict):
-        results, ts = raw.get("results"), raw.get("ts")
-    else:
-        results, ts = raw, None
-    if not isinstance(results, list) or not results:
-        raise ValueError("not a non-empty list of results")
-    for i, r in enumerate(results):
-        if not isinstance(r, dict):
-            raise ValueError(f"results[{i}] must be an object, not {type(r).__name__}")
-        if not isinstance(r.get("name"), str) or not r["name"]:
-            raise ValueError(f"results[{i}].name must be a non-empty string")
-        missing = [k for k in RENDER_REQUIRED_KEYS if k not in r]
-        if missing:
-            raise ValueError(
-                f"results[{i}] is missing field(s) the report renders: "
-                + ", ".join(missing))
-    return results, ts if isinstance(ts, str) else None
+    raw, mtime = _read_store_fd(Path(path))
+    results, ts = _parse_store(raw)
+    return results, ts, mtime
+
+
+def _load_previous_verdicts_lenient(path: Path) -> dict[str, str]:
+    """name -> previous verdict, for the producer's changed-arrows.
+
+    Round 3: the strict typed loader now backs the consumer, and wiring the
+    producer's diff to it would mean ONE malformed record in the previous
+    store silently kills every changed-arrow for the night (the strict load
+    raises, the caller catches, previous = {}). This loader asks only the two
+    questions the diff needs — is there a name, is there a verdict string —
+    and keeps every record that answers both, so a single bad record costs
+    only its own arrow, never the night's.
+    """
+    try:
+        raw, _ = _read_store_fd(Path(path))
+    except (OSError, ValueError):
+        return {}
+    results = raw.get("results") if isinstance(raw, dict) else raw
+    if not isinstance(results, list):
+        return {}
+    previous: dict[str, str] = {}
+    for r in results:
+        if (isinstance(r, dict) and isinstance(r.get("name"), str) and r["name"]
+                and isinstance(r.get("verdict"), str)):
+            previous[r["name"]] = r["verdict"]
+    return previous
 
 
 def _age_h_from_capture(ts: str | None, mtime: float | None) -> float | None:
@@ -420,6 +567,11 @@ def _age_h_from_capture(ts: str | None, mtime: float | None) -> float | None:
     TOCTOU note there). A corrupt embedded ts falls through to mtime: the
     store proved readable, only the stamp is garbage, so the age is not
     unknowable.
+
+    A future ts (clock skew, or a store written by a fast clock) computes a
+    NEGATIVE age; clamping it to 0.0 in both branches made a corrupt-future
+    store read fresh forever. A negative age is evidence the stamp is not
+    trustworthy, so it falls through to mtime instead (round 3).
     """
     if ts is not None:
         try:
@@ -429,7 +581,10 @@ def _age_h_from_capture(ts: str | None, mtime: float | None) -> float | None:
         if stamped is not None:
             if stamped.tzinfo is None:
                 stamped = stamped.replace(tzinfo=timezone.utc)
-            return max(0.0, (datetime.now(timezone.utc) - stamped).total_seconds() / 3600.0)
+            age = (datetime.now(timezone.utc) - stamped).total_seconds() / 3600.0
+            if age >= 0.0:
+                return age
+            # future stamp: not merely fresh — untrustworthy. Try mtime.
     if mtime is None:
         return None
     return max(0.0, (datetime.now(timezone.utc).timestamp() - mtime) / 3600.0)
@@ -444,17 +599,21 @@ def verdicts_age_h(state_dir: Path) -> float | None:
     class: the banner used to age the heartbeat while serving the verdicts).
     Embedded ts is authoritative; file mtime is the fallback for legacy
     stores. Unknowable age returns None — unknown is not false.
+
+    The ts and the mtime are captured from the SAME file descriptor as the
+    bytes (round 3: this used to load the store and then stat the path —
+    two opens, so a sweep landing between them paired old data with a fresh
+    mtime on exactly the legacy shape whose only age source is mtime).
+    Record validity is deliberately NOT required here: the age of a store
+    does not depend on whether its records render.
     """
     vpath = Path(state_dir) / VERDICTS_FILENAME
     try:
-        ts = None
-        try:
-            _, ts = load_stored_verdicts(vpath)
-        except (OSError, ValueError):
-            pass
-        return _age_h_from_capture(ts, vpath.stat().st_mtime)
+        raw, mtime = _read_store_fd(vpath)
     except (OSError, ValueError):
         return None
+    ts = raw.get("ts") if isinstance(raw, dict) else None
+    return _age_h_from_capture(ts if isinstance(ts, str) else None, mtime)
 
 
 def emit_staleness_banner(state_dir, max_age_mins=180, stream=None,
@@ -487,27 +646,47 @@ def emit_staleness_banner(state_dir, max_age_mins=180, stream=None,
     return True
 
 
-def render_report(results: list[dict], state_dir: Path, quiet: bool = False,
+# Text-table columns in print order: (attribute, width, label, right-align).
+# Every attribute here is a typed field on StoredVerdict — the render schema
+# lives in ONE place (the dataclass), so there is no second key set to drift
+# out of sync and nothing left to weld together with an import-time assert
+# (round 3 removed RENDER_REQUIRED_KEYS and the weld; see StoredVerdict).
+_RENDER_COLUMNS = (
+    ("head",    13, "head",   False),
+    ("behind",   6, "behind", True),
+    ("ahead",    5, "ahead",  True),
+    ("stashes",  5, "stash",  True),
+    ("dirty",    5, "dirty",  True),
+)
+
+
+def render_report(results: list, state_dir: Path, quiet: bool = False,
                   served_ts: str | None = None) -> int:
-    """Print the human report for `results` — live from a sweep, or stored."""
-    problems = [r for r in results if r.get("verdict") in PROBLEM_VERDICTS]
+    """Print the human report for `results` — live from a sweep, or stored.
+
+    `results` items are StoredVerdict records (attributes, not dict keys):
+    the producer wraps its fresh sweep dicts, the consumer loads them from
+    the store — both go through the same typed record, so a live sweep and
+    a replay of the same data are rendered by identical code paths.
+    """
+    problems = [r for r in results if r.verdict in PROBLEM_VERDICTS]
     if quiet:
-        speak = ([r for r in results if r.get("changed")]
-                 + [r for r in problems if not r.get("changed")])
+        speak = ([r for r in results if r.changed]
+                 + [r for r in problems if not r.changed])
         if not speak:
             return 0                      # all-clear is silent, by contract
         print("FLEET DRIFT REPORT — attention required\n")
         for r in speak:
-            arrow = f"  (was {r.get('previous_verdict')})" if r.get("changed") else ""
-            print(f"  {r['name']:18} {r['verdict']}{arrow}")
-            for reason in r.get("reasons") or []:
+            arrow = f"  (was {r.previous_verdict})" if r.changed else ""
+            print(f"  {r.name:18} {r.verdict}{arrow}")
+            for reason in r.reasons:
                 print(f"      - {reason}")
         return 0
 
-    width = max(len(r["name"]) for r in results)
+    width = max(len(r.name) for r in results)
 
     def cell(r, key, w, right):
-        v = r[key]
+        v = getattr(r, key)
         if right:                       # numeric columns: only None is '-'
             return (str(v) if v is not None else "-").rjust(w)
         return (str(v) if v else "-").ljust(w)   # head: '' renders as '-'
@@ -517,12 +696,12 @@ def render_report(results: list[dict], state_dir: Path, quiet: bool = False,
         for _k, w, label, right in _RENDER_COLUMNS) + "  notes"
     print(header)
     print("-" * (width + 78))
-    for r in sorted(results, key=lambda x: (x["verdict"] not in PROBLEM_VERDICTS, x["name"])):
+    for r in sorted(results, key=lambda x: (x.verdict not in PROBLEM_VERDICTS, x.name)):
         cells = " ".join(
             cell(r, key, w, right) for key, w, _label, right in _RENDER_COLUMNS)
-        print(f"{r['name'].ljust(width)}  {r['verdict']:11} {cells}  "
-              f"{(r.get('reasons') or [''])[0]}")
-        for reason in (r.get("reasons") or [])[1:]:
+        print(f"{r.name.ljust(width)}  {r.verdict:11} {cells}  "
+              f"{(r.reasons or [''])[0]}")
+        for reason in (r.reasons or [])[1:]:
             print(f"{' ' * (width + 44)}{reason}")
     if served_ts is None:
         # Producer (sweep) mode: this run wrote the state the next consumer
@@ -566,26 +745,29 @@ def serve_stored_state(args) -> int:
               file=sys.stderr)
         return 1
     try:
-        # Read the store ONCE and capture its mtime alongside: everything
-        # below (banner, table, JSON) is derived from this single snapshot.
-        # Re-reading inside emit_staleness_banner was a TOCTOU: a sweep
-        # landing between the two reads replaced the store with a fresh one,
-        # and the banner labelled the OLD results we still serve with the NEW
-        # timestamp (review round 2). Ageing the captured bytes closes it.
-        results, served_ts = load_stored_verdicts(prev_path)
-        served_mtime = prev_path.stat().st_mtime
+        # Read the store ONCE from a single fd: bytes and mtime are captured
+        # from the same open file description, and every record is validated
+        # into a typed StoredVerdict BEFORE any banner or table. Two rounds
+        # of read-then-re-read TOCTOU and render-crashes-after-the-banner
+        # both live here, and both are closed by read-once-at-the-top:
+        #   * a sweep replacing the file mid-serve can no longer pair old
+        #     results with a fresh mtime (round 2 banner TOCTOU; round 3
+        #     found the same race in the bytes/mtime pairing itself);
+        #   * a malformed record dies inside the loader with a field name,
+        #     not inside the renderer with a traceback (rounds 2 and 3).
+        results, served_ts, served_mtime = load_stored_verdicts(prev_path)
     except (OSError, ValueError) as exc:
         print(f"fleet_report: stored verdicts unreadable ({exc})", file=sys.stderr)
         return 1
 
     # A stored report is a replay, not a live observation: 'changed'/'previous_verdict'
     # were computed against the state of the world one sweep ago and must not be
-    # re-announced as if they just happened. Reset in place (not popped) so the
+    # re-announced as if they just happened. Reset in place (not dropped) so the
     # --json schema keeps its keys with inert values instead of silently
     # dropping fields between a sweep and a replay.
     for r in results:
-        r["changed"] = False
-        r["previous_verdict"] = None
+        r.changed = False
+        r.previous_verdict = None
 
     # Staleness first, before any table, so a reader can never mistake an
     # old sweep for a current one (2026-09-03). Unconditional w.r.t. --quiet:
@@ -600,10 +782,22 @@ def serve_stored_state(args) -> int:
         age_h=_age_h_from_capture(served_ts, served_mtime))
 
     if args.json:
-        print(json.dumps(results, indent=2))
+        print(json.dumps([r.as_dict() for r in results], indent=2))
         return 2 if bannered else 0
     rc = render_report(results, state_dir, quiet=args.quiet, served_ts=served_ts)
     return 2 if bannered else rc
+
+
+def _parse_store(raw) -> tuple[list, str | None]:
+    """Decode an already-read store payload into (StoredVerdicts, ts)."""
+    if isinstance(raw, dict):
+        results, ts = raw.get("results"), raw.get("ts")
+    else:
+        results, ts = raw, None
+    if not isinstance(results, list) or not results:
+        raise ValueError("not a non-empty list of results")
+    return [StoredVerdict(i, r) for i, r in enumerate(results)], (
+        ts if isinstance(ts, str) else None)
 
 
 def main() -> int:
@@ -646,19 +840,17 @@ def main() -> int:
     state_dir = Path(args.state)
     state_dir.mkdir(parents=True, exist_ok=True)
     prev_path = state_dir / VERDICTS_FILENAME
-    previous = {}
-    if prev_path.is_file():
-        try:
-            # Both shapes: current {"ts":..., "results":[...]} and the legacy
-            # bare list written before the ts-inside-the-store fix.
-            prev_results, _ = load_stored_verdicts(prev_path)
-            previous = {r["name"]: r for r in prev_results}
-        except (OSError, ValueError, KeyError):
-            previous = {}
+    # The producer's changed-arrows diff against the PREVIOUS store goes
+    # through the LENIENT loader (name+verdict only): one malformed record
+    # in yesterday's store must cost its own arrow, not the whole night's
+    # (round 3 — the strict typed loader backs the consumer, where a bad
+    # record means we cannot faithfully serve the report at all).
+    previous = _load_previous_verdicts_lenient(prev_path) \
+        if prev_path.is_file() else {}
 
     changed, problems = [], []
     for r in results:
-        was = previous.get(r["name"], {}).get("verdict")
+        was = previous.get(r["name"])
         r["previous_verdict"] = was
         r["changed"] = was is not None and was != r["verdict"]
         if r["changed"]:
@@ -689,7 +881,8 @@ def main() -> int:
         print(json.dumps(results, indent=2))
         return 0
 
-    return render_report(results, state_dir, quiet=args.quiet)
+    return render_report([StoredVerdict(i, r) for i, r in enumerate(results)],
+                         state_dir, quiet=args.quiet)
 
 
 if __name__ == "__main__":

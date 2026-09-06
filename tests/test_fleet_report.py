@@ -61,10 +61,12 @@ def _snapshot_state(state_dir):
     rglob + files-only + relative paths: a real state dir can grow subdirs
     (round 2: iterdir() hit IsADirectoryError the moment one existed), and a
     proof that dies on the shape it is proving read-only proves nothing.
+    Paths compare as_posix() so the proof is platform-stable (round 3: on
+    Windows os.sep made the same dir compare unequal to itself).
     """
     root = Path(state_dir)
     return sorted(
-        (str(p.relative_to(root)), p.read_bytes())
+        (p.relative_to(root).as_posix(), p.read_bytes())
         for p in root.rglob("*") if p.is_file()
     )
 
@@ -379,8 +381,9 @@ def test_no_sweep_minimal_record_missing_render_keys_is_a_one_line_error(
         tmp_path, capsys):
     """ROUND 2 MAJOR: a record with exactly {name, verdict} passed the old
     validator (it only checked those two) and then KeyError'd on 'head' in
-    render, AFTER the banner. Validation must cover the FULL key set render
-    consumes — via RENDER_REQUIRED_KEYS, shared with the renderer."""
+    render, AFTER the banner. Validation must cover the FULL field set
+    render consumes — every field is now a typed StoredVerdict attribute
+    constructed at load time, before the banner (round 3)."""
     state = tmp_path / "state"
     state.mkdir(parents=True)
     (state / "fleet-verdicts.json").write_text(
@@ -390,8 +393,45 @@ def test_no_sweep_minimal_record_missing_render_keys_is_a_one_line_error(
     err = capsys.readouterr().err
     assert rc == 1
     assert "fleet_report: stored verdicts unreadable" in err
-    assert "head" in err, "the error must name the missing render key"
+    assert "head" in err, "the error must name the missing render field"
     assert "Traceback" not in err
+
+
+@pytest.mark.parametrize("bad_field,bad_value,want_in_error", [
+    ("verdict", None, "verdict"),
+    ("verdict", [], "verdict"),
+    ("verdict", 5, "verdict"),
+    ("head", 5, "head"),
+    ("head", None, "head"),
+    ("behind", "many", "behind"),
+    ("behind", 1.5, "behind"),
+    ("stashes", ["0"], "stashes"),
+    ("dirty", False, "dirty"),
+])
+def test_no_sweep_wrong_typed_present_keys_are_one_line_errors(
+        tmp_path, capsys, bad_field, bad_value, want_in_error):
+    """ROUND 3 MAJOR (class-close): a record where a render field is PRESENT
+    but the WRONG TYPE passed the old key-presence validator and died in
+    render as a TypeError AFTER the banner (verdict:null, observed live by
+    the controller). The typed record constructor must reject each of these
+    at LOAD time with the field name in a one-line stderr message."""
+    state = tmp_path / "state"
+    state.mkdir(parents=True)
+    stored = dict(HEALTHY_RESULT)
+    stored[bad_field] = bad_value
+    (state / "fleet-verdicts.json").write_text(
+        json.dumps({"ts": datetime.now(timezone.utc).isoformat(),
+                    "results": [stored]}), encoding="utf-8")
+    with _no_sweep_guard():
+        rc = _run_main(["fleet_report.py", "--no-sweep", "--state", str(state)])
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "fleet_report: stored verdicts unreadable" in err
+    assert want_in_error in err, "the error must name the bad field"
+    assert "Traceback" not in err
+    out = capsys.readouterr().out
+    assert "STALE DATA" not in out and "box-a" not in out, (
+        "nothing may be served or bannered from a rejected store")
 
 
 def test_no_sweep_record_with_non_string_name_is_rejected(tmp_path, capsys):
@@ -408,14 +448,34 @@ def test_no_sweep_record_with_non_string_name_is_rejected(tmp_path, capsys):
     assert "Traceback" not in err
 
 
-def test_render_required_keys_match_validator_constant():
-    """Drift-proofing: the renderer's table columns and the validator's key
-    set are welded together at import time (see the module assert). This test
-    pins the contract from the consumer side so a regression in either half
-    is caught by name."""
-    from fleettools.fleet_report import RENDER_REQUIRED_KEYS
-    assert set(RENDER_REQUIRED_KEYS) >= {
-        "name", "verdict", "head", "behind", "ahead", "stashes", "dirty"}
+def test_render_schema_lives_on_the_typed_record():
+    """Drift-proofing, round 3 form: the render schema is the StoredVerdict
+    dataclass itself — the renderer reads typed attributes, so there is no
+    second key set to drift out of sync and no import-time weld left to
+    remove. This pins the contract from the consumer side: every column the
+    table renders must be a validated field on the record, and constructing
+    one from a healthy stored dict must round-trip its render fields."""
+    import dataclasses
+    from fleettools.fleet_report import StoredVerdict, _RENDER_COLUMNS
+    field_names = {f.name for f in dataclasses.fields(StoredVerdict)}
+    for key, _w, _label, _right in _RENDER_COLUMNS:
+        assert key in field_names, (
+            f"render column '{key}' is not a StoredVerdict field")
+    assert {"name", "verdict"} <= field_names
+    rec = StoredVerdict(0, dict(HEALTHY_RESULT))
+    assert rec.name == "box-a"
+    assert rec.verdict == "CURRENT"
+    assert rec.head == "26f178e5fa78"
+    assert (rec.behind, rec.ahead, rec.stashes, rec.dirty) == (0, 0, 0, 0)
+    # Null counts are the producer's own output for UNREACHABLE/UNKNOWN
+    # probes — they must load and render (as '-'), not be rejected.
+    unreachable = dict(HEALTHY_RESULT, verdict="UNREACHABLE", head="",
+                       behind=None, ahead=None, stashes=None, dirty=None,
+                       reasons=["timed out after 240s"])
+    rec = StoredVerdict(0, unreachable)
+    assert rec.verdict == "UNREACHABLE"
+    assert (rec.behind, rec.ahead, rec.stashes, rec.dirty) == (None, None,
+                                                               None, None)
 
 
 def test_no_sweep_stale_text_mode_exits_2(tmp_path, capsys):
@@ -451,12 +511,12 @@ def test_no_sweep_serves_a_single_consistent_read_not_a_racing_re_read(
     state = _write_state(tmp_path, day_old)
     fresh_results = [dict(HEALTHY_RESULT, head="ffffffffffff")]
 
-    real_load = fr.load_stored_verdicts
+    real_read = fr._read_store_fd
     reads = {"n": 0}
 
-    def racing_load(path):
+    def racing_read(path):
         reads["n"] += 1
-        res = real_load(path)
+        res = real_read(path)
         if reads["n"] == 1:
             # a sweep lands between serve's read and the banner's re-read
             fresh = datetime.now(timezone.utc).isoformat()
@@ -465,7 +525,7 @@ def test_no_sweep_serves_a_single_consistent_read_not_a_racing_re_read(
         return res
 
     with _no_sweep_guard(), \
-         mock.patch.object(fr, "load_stored_verdicts", side_effect=racing_load):
+         mock.patch.object(fr, "_read_store_fd", side_effect=racing_read):
         rc = _run_main(["fleet_report.py", "--no-sweep", "--state", str(state)])
     out = capsys.readouterr().out
     assert reads["n"] == 1, "the serve path must read the store exactly once"
@@ -475,6 +535,128 @@ def test_no_sweep_serves_a_single_consistent_read_not_a_racing_re_read(
     assert rc == 2
     # the served table is still the captured (old) read, not the racer's
     assert "26f178e5fa78" in out
+
+
+def test_no_sweep_legacy_store_bytes_and_mtime_come_from_the_same_fd(
+        tmp_path, capsys):
+    """ROUND 3 MAJOR (TOCTOU, bytes/mtime pairing): on a legacy bare-list
+    store the file mtime is the ONLY age source, and the loader used to
+    read the bytes with read_text() and THEN stat the path — two opens. A
+    sweep landing between them served the OLD bytes paired with the NEW
+    file's fresh mtime: age 0, no banner, a day-old report passing as
+    current. The fix reads bytes and fstat from ONE descriptor, so the
+    mtime provably describes the exact bytes served. Simulated at the
+    syscall layer: the sweep's replace() fires between open/fstat and the
+    read of the old inode."""
+    state = tmp_path / "state"
+    state.mkdir(parents=True)
+    vpath = state / "fleet-verdicts.json"
+    day_old_mtime = datetime.now().timestamp() - 24 * 3600
+    vpath.write_text(json.dumps([HEALTHY_RESULT]), encoding="utf-8")
+    os.utime(vpath, (day_old_mtime, day_old_mtime))
+
+    real_open = os.open
+    raced = {"done": False}
+
+    def racing_open(path, flags, *a, **kw):
+        fd = real_open(path, flags, *a, **kw)
+        if not raced["done"] and str(vpath) == str(path):
+            raced["done"] = True
+            # The sweep lands right after the consumer opened the old store:
+            # a fresh atomic rewrite replaces the path (new inode, fresh
+            # mtime) while the consumer still holds the old fd.
+            real_replace(vpath)
+        return fd
+
+    def real_replace(path):
+        tmp = Path(str(path) + ".racer")
+        fresh = datetime.now(timezone.utc).isoformat()
+        tmp.write_text(json.dumps(
+            {"ts": fresh, "results": [dict(HEALTHY_RESULT,
+                                           head="ffffffffffff")]}),
+            encoding="utf-8")
+        os.replace(tmp, path)
+
+    with _no_sweep_guard(), \
+         mock.patch.object(fr.os, "open", side_effect=racing_open):
+        rc = _run_main(["fleet_report.py", "--no-sweep", "--state", str(state)])
+    out = capsys.readouterr().out
+    assert "STALE DATA" in out and "24" in out, (
+        "the served day-old bytes must be bannered with the mtime captured "
+        "from the SAME fd, even though the path now holds a fresh sweep")
+    assert rc == 2
+    assert "26f178e5fa78" in out, "the table serves the captured old bytes"
+    assert "ffffffffffff" not in out, "the racer's fresh bytes never leak in"
+
+
+def test_future_embedded_ts_falls_back_to_mtime_not_age_zero(
+        tmp_path, capsys):
+    """ROUND 3 MINOR: a store stamped in the future (clock skew) used to
+    compute a NEGATIVE age which max(0.0, ...) clamped to 0.0 in both
+    branches — fresh forever. A negative age means the stamp is not
+    trustworthy: the age must fall through to file mtime, which here says
+    a day old, so the banner fires."""
+    state = tmp_path / "state"
+    state.mkdir(parents=True)
+    vpath = state / "fleet-verdicts.json"
+    future = (datetime.now(timezone.utc) + timedelta(hours=12)).isoformat()
+    vpath.write_text(json.dumps({"ts": future, "results": [HEALTHY_RESULT]}),
+                     encoding="utf-8")
+    day_old_mtime = datetime.now().timestamp() - 24 * 3600
+    os.utime(vpath, (day_old_mtime, day_old_mtime))
+    age = fr.verdicts_age_h(state)
+    assert age is not None and 23 < age < 25, (
+        "a future ts must not read as age 0.0 forever; mtime is the answer")
+    before = _snapshot_state(state)
+    with _no_sweep_guard():
+        rc = _run_main(["fleet_report.py", "--no-sweep", "--state", str(state)])
+    out = capsys.readouterr().out
+    assert rc == 2 and "STALE DATA" in out and "24" in out
+    assert _snapshot_state(state) == before
+
+
+def test_future_ts_at_unit_level_falls_through_to_mtime():
+    """Unit-level pin of the fall-through: future ts -> mtime, not 0.0."""
+    future = datetime.now(timezone.utc) + timedelta(hours=6)
+    day_old_mtime = datetime.now().timestamp() - 24 * 3600
+    age = fr._age_h_from_capture(future.isoformat(), day_old_mtime)
+    assert age is not None and 23 < age < 25
+    # a future ts with no mtime available is unknowable, not zero
+    assert fr._age_h_from_capture(future.isoformat(), None) is None
+    # a PAST ts still wins over mtime (authoritative when sane)
+    past = datetime.now(timezone.utc) - timedelta(hours=2)
+    age = fr._age_h_from_capture(past.isoformat(), day_old_mtime)
+    assert age is not None and 1.9 < age < 2.1
+
+
+def test_producer_changed_arrows_survive_one_bad_previous_record(
+        tmp_path, capsys):
+    """ROUND 3 MINOR: the strict typed loader now backs the consumer, and
+    wiring the producer's diff to it would let ONE malformed record in
+    yesterday's store kill EVERY changed-arrow for the night (strict load
+    raises -> previous={} -> no arrows). The producer diffs through a
+    lenient loader keyed on name+verdict only, so a bad record costs its
+    own arrow and nothing else."""
+    state = tmp_path / "state"
+    state.mkdir(parents=True)
+    bad_record = dict(HEALTHY_RESULT, name="box-b", verdict=None)
+    good_record = dict(HEALTHY_RESULT, name="box-c", verdict="BEHIND",
+                       behind=7)
+    (state / "fleet-verdicts.json").write_text(
+        json.dumps({"ts": "2026-09-05T02:30:00+00:00",
+                    "results": [bad_record, good_record]}),
+        encoding="utf-8")
+    roster = _write_roster(tmp_path)
+    live = [dict(HEALTHY_RESULT, name="box-c", verdict="CURRENT")]
+    with mock.patch.object(fr, "probe", side_effect=live):
+        rc = _run_main(["fleet_report.py", "--roster", str(roster),
+                        "--state", str(state)])
+    assert rc == 0
+    store = json.loads((state / "fleet-verdicts.json").read_text())
+    served = {r["name"]: r for r in store["results"]}
+    assert served["box-c"]["changed"] is True, (
+        "box-c's BEHIND->CURRENT arrow must survive box-b's null verdict")
+    assert served["box-c"]["previous_verdict"] == "BEHIND"
 
 
 def test_no_sweep_json_keeps_changed_and_previous_verdict_keys(
@@ -513,9 +695,15 @@ def test_snapshot_state_survives_subdirs_in_the_state_dir(tmp_path, capsys):
     assert _snapshot_state(state) == before, "read-only proof covers subdirs too"
 
 
+@pytest.mark.skipif(os.name == "nt",
+                    reason="POSIX-only: Windows has no mode bits, stat reads 0o666")
 def test_atomic_write_preserves_0644_store_permissions(tmp_path):
     """ROUND 2 MINOR: mkstemp creates the temp file 0600, silently tightening
-    the store's historical 0644 for every secondary reader."""
+    the store's historical 0644 for every secondary reader.
+
+    POSIX-only (round 3): Windows has no POSIX mode bits — chmod there is a
+    read-only attribute flip and stat() reads 0o666 regardless — so this
+    would go RED, not meaningful, on Windows. Skipped there on purpose."""
     from fleettools.fleet_report import _atomic_write_json
     p = tmp_path / "fleet-verdicts.json"
     _atomic_write_json(p, {"ts": "x", "results": []})
