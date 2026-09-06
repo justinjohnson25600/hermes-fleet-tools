@@ -56,10 +56,16 @@ def _write_verdicts(state_dir, ts_iso=None, results=None, mtime=None):
 
 
 def _snapshot_state(state_dir):
-    """sorted (name, bytes) of the WHOLE state dir — the read-only proof."""
+    """Sorted (relative path, bytes) of the WHOLE state dir — the read-only proof.
+
+    rglob + files-only + relative paths: a real state dir can grow subdirs
+    (round 2: iterdir() hit IsADirectoryError the moment one existed), and a
+    proof that dies on the shape it is proving read-only proves nothing.
+    """
+    root = Path(state_dir)
     return sorted(
-        (p.name, p.read_bytes())
-        for p in Path(state_dir).iterdir()
+        (str(p.relative_to(root)), p.read_bytes())
+        for p in root.rglob("*") if p.is_file()
     )
 
 
@@ -88,7 +94,10 @@ def test_missing_store_no_crash_no_banner(tmp_path, capsys):
     assert "STALE DATA" not in capsys.readouterr().out
 
 
-def test_malformed_ts_no_crash_no_banner(tmp_path, capsys):
+def test_malformed_ts_fresh_mtime_no_crash_no_banner(tmp_path, capsys):
+    """Corrupt embedded ts, fresh file: mtime fallback says fresh, so serve
+    quietly. (Round 2 changed this contract: a corrupt ts no longer means
+    unknowable age — see test_no_sweep_corrupt_ts_with_old_mtime_banners.)"""
     _write_verdicts(tmp_path, ts_iso="not-a-timestamp")
     fired = fr.emit_staleness_banner(tmp_path, max_age_mins=180)
     assert fired is False
@@ -200,8 +209,8 @@ def test_no_sweep_on_day_old_state_dir_prints_banner(tmp_path, capsys):
     before = _snapshot_state(state)
     with _no_sweep_guard():
         rc = _run_main(["fleet_report.py", "--no-sweep", "--state", str(state)])
-    assert rc == 0
     out = capsys.readouterr().out
+    assert rc == 2, "stale text-mode serve must signal via rc (README rc table)"
     assert "STALE DATA" in out and "24" in out
     assert "box-a" in out, "the stored report itself is still printed"
     # read-only: the WHOLE state dir is byte-identical, and no probe ran
@@ -241,7 +250,7 @@ def test_no_sweep_legacy_bare_list_with_day_old_mtime_banners(
     with _no_sweep_guard():
         rc = _run_main(["fleet_report.py", "--no-sweep", "--state", str(state)])
     out = capsys.readouterr().out
-    assert rc == 0
+    assert rc == 2, "stale serve signals rc=2 in text mode too (README table)"
     assert "STALE DATA" in out and "24" in out
     assert _snapshot_state(state) == before
 
@@ -260,7 +269,7 @@ def test_no_sweep_fresh_heartbeat_but_day_old_verdicts_still_banners(
     with _no_sweep_guard():
         rc = _run_main(["fleet_report.py", "--no-sweep", "--state", str(state)])
     out = capsys.readouterr().out
-    assert rc == 0
+    assert rc == 2, "stale serve signals rc=2 in text mode too (README table)"
     assert "STALE DATA" in out and "24" in out, (
         "a fresh heartbeat must not vouch for day-old verdicts")
     assert _snapshot_state(state) == before
@@ -284,8 +293,10 @@ def test_no_sweep_missing_state_dir_no_crash_no_banner(tmp_path, capsys):
     assert rc == 1, "nothing to serve must be a visible failure, not silence"
 
 
-def test_no_sweep_malformed_ts_no_crash_no_banner(tmp_path, capsys):
-    """Age unknowable is not age false: fail open, serve the stored report."""
+def test_no_sweep_corrupt_ts_fresh_mtime_no_crash_no_banner(tmp_path, capsys):
+    """A corrupt embedded ts with a FRESH mtime: age is unknowable-from-ts but
+    the file itself is new, so mtime fallback says fresh — serve, no banner,
+    no crash. (The store proved readable; only the stamp is garbage.)"""
     state = _write_state(tmp_path, "not-a-timestamp")
     before = _snapshot_state(state)
     with _no_sweep_guard():
@@ -294,6 +305,42 @@ def test_no_sweep_malformed_ts_no_crash_no_banner(tmp_path, capsys):
     assert rc == 0
     assert "STALE DATA" not in out and "box-a" in out
     assert _snapshot_state(state) == before
+
+
+def test_no_sweep_corrupt_ts_with_old_mtime_banners(tmp_path, capsys):
+    """ROUND 2 MAJOR: ts='not-a-timestamp' + 24h-old mtime used to exit 0
+    with no banner — fromisoformat raised inside the broad except, so the
+    mtime fallback was unreachable and a 24h-old corrupt store served as
+    fresh. A readable store with a garbage stamp must age by mtime."""
+    state = tmp_path / "state"
+    state.mkdir(parents=True)
+    vpath = state / "fleet-verdicts.json"
+    vpath.write_text(json.dumps(
+        {"ts": "not-a-timestamp", "results": [HEALTHY_RESULT]}), encoding="utf-8")
+    day_old_mtime = datetime.now().timestamp() - 24 * 3600
+    os.utime(vpath, (day_old_mtime, day_old_mtime))
+    before = _snapshot_state(state)
+    with _no_sweep_guard():
+        rc = _run_main(["fleet_report.py", "--no-sweep", "--state", str(state)])
+    out = capsys.readouterr().out
+    assert rc == 2, "corrupt ts must fall through to mtime, not fail open"
+    assert "STALE DATA" in out and "24" in out
+    assert "box-a" in out, "the stored report itself is still served"
+    assert _snapshot_state(state) == before
+
+
+def test_verdicts_age_h_corrupt_ts_falls_back_to_mtime(tmp_path):
+    """Unit-level: the mtime fallback must be reachable when fromisoformat
+    raises, instead of the raise being swallowed into None (fail-open)."""
+    state = tmp_path / "state"
+    state.mkdir(parents=True)
+    vpath = state / "fleet-verdicts.json"
+    vpath.write_text(json.dumps(
+        {"ts": "not-a-timestamp", "results": [HEALTHY_RESULT]}), encoding="utf-8")
+    day_old_mtime = datetime.now().timestamp() - 24 * 3600
+    os.utime(vpath, (day_old_mtime, day_old_mtime))
+    age = fr.verdicts_age_h(state)
+    assert age is not None and 23 < age < 25
 
 
 def test_no_sweep_bare_string_list_is_a_one_line_error_not_a_traceback(
@@ -326,6 +373,153 @@ def test_no_sweep_missing_name_field_is_a_one_line_error_not_a_traceback(
     assert rc == 1
     assert "fleet_report: stored verdicts unreadable" in err
     assert "Traceback" not in err
+
+
+def test_no_sweep_minimal_record_missing_render_keys_is_a_one_line_error(
+        tmp_path, capsys):
+    """ROUND 2 MAJOR: a record with exactly {name, verdict} passed the old
+    validator (it only checked those two) and then KeyError'd on 'head' in
+    render, AFTER the banner. Validation must cover the FULL key set render
+    consumes — via RENDER_REQUIRED_KEYS, shared with the renderer."""
+    state = tmp_path / "state"
+    state.mkdir(parents=True)
+    (state / "fleet-verdicts.json").write_text(
+        json.dumps([{"name": "box-a", "verdict": "CURRENT"}]), encoding="utf-8")
+    with _no_sweep_guard():
+        rc = _run_main(["fleet_report.py", "--no-sweep", "--state", str(state)])
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "fleet_report: stored verdicts unreadable" in err
+    assert "head" in err, "the error must name the missing render key"
+    assert "Traceback" not in err
+
+
+def test_no_sweep_record_with_non_string_name_is_rejected(tmp_path, capsys):
+    """A numeric name is a malformed record, not a render-time crash."""
+    state = tmp_path / "state"
+    state.mkdir(parents=True)
+    (state / "fleet-verdicts.json").write_text(
+        json.dumps([dict(HEALTHY_RESULT, name=42)]), encoding="utf-8")
+    with _no_sweep_guard():
+        rc = _run_main(["fleet_report.py", "--no-sweep", "--state", str(state)])
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "fleet_report: stored verdicts unreadable" in err
+    assert "Traceback" not in err
+
+
+def test_render_required_keys_match_validator_constant():
+    """Drift-proofing: the renderer's table columns and the validator's key
+    set are welded together at import time (see the module assert). This test
+    pins the contract from the consumer side so a regression in either half
+    is caught by name."""
+    from fleettools.fleet_report import RENDER_REQUIRED_KEYS
+    assert set(RENDER_REQUIRED_KEYS) >= {
+        "name", "verdict", "head", "behind", "ahead", "stashes", "dirty"}
+
+
+def test_no_sweep_stale_text_mode_exits_2(tmp_path, capsys):
+    """ROUND 2 MAJOR: only --json returned 2 while the README exit-code table
+    is mode-unqualified. A bannered text-mode serve must also exit 2."""
+    day_old = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    state = _write_state(tmp_path, day_old)
+    before = _snapshot_state(state)
+    with _no_sweep_guard():
+        rc = _run_main(["fleet_report.py", "--no-sweep", "--state", str(state)])
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "STALE DATA" in out
+    assert _snapshot_state(state) == before
+
+
+def test_no_sweep_fresh_text_mode_exits_0(tmp_path, capsys):
+    state = _write_state(tmp_path, datetime.now(timezone.utc).isoformat())
+    with _no_sweep_guard():
+        rc = _run_main(["fleet_report.py", "--no-sweep", "--state", str(state)])
+    assert rc == 0
+    assert "STALE DATA" not in capsys.readouterr().out
+
+
+def test_no_sweep_serves_a_single_consistent_read_not_a_racing_re_read(
+        tmp_path, capsys):
+    """ROUND 2 MAJOR (TOCTOU): serve_stored_state loaded the store, then
+    emit_staleness_banner re-read the same file. A sweep landing between the
+    two reads replaced the store mid-serve, so the banner aged the NEW file
+    while the table served the OLD results — stale data, no banner. The serve
+    path must read ONCE and age what it captured."""
+    day_old = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    state = _write_state(tmp_path, day_old)
+    fresh_results = [dict(HEALTHY_RESULT, head="ffffffffffff")]
+
+    real_load = fr.load_stored_verdicts
+    reads = {"n": 0}
+
+    def racing_load(path):
+        reads["n"] += 1
+        res = real_load(path)
+        if reads["n"] == 1:
+            # a sweep lands between serve's read and the banner's re-read
+            fresh = datetime.now(timezone.utc).isoformat()
+            Path(path).write_text(
+                json.dumps({"ts": fresh, "results": fresh_results}), encoding="utf-8")
+        return res
+
+    with _no_sweep_guard(), \
+         mock.patch.object(fr, "load_stored_verdicts", side_effect=racing_load):
+        rc = _run_main(["fleet_report.py", "--no-sweep", "--state", str(state)])
+    out = capsys.readouterr().out
+    assert reads["n"] == 1, "the serve path must read the store exactly once"
+    assert "STALE DATA" in out, (
+        "the day-old results being served must be bannered even though a "
+        "sweep freshened the file mid-serve")
+    assert rc == 2
+    # the served table is still the captured (old) read, not the racer's
+    assert "26f178e5fa78" in out
+
+
+def test_no_sweep_json_keeps_changed_and_previous_verdict_keys(
+        tmp_path, capsys):
+    """ROUND 2 MINOR: popping 'changed'/'previous_verdict' silently changed
+    the --json schema between a sweep and a replay. Replay resets them to
+    inert values (False / None) but the KEYS must survive."""
+    day_old = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    stored = [dict(HEALTHY_RESULT, changed=True, previous_verdict="CURRENT")]
+    state = _write_state(tmp_path, day_old, results=stored)
+    with _no_sweep_guard():
+        rc = _run_main(["fleet_report.py", "--no-sweep", "--json",
+                        "--state", str(state)])
+    captured = capsys.readouterr()
+    assert rc == 2
+    payload = json.loads(captured.out)
+    assert payload[0]["changed"] is False
+    assert payload[0]["previous_verdict"] is None
+
+
+def test_snapshot_state_survives_subdirs_in_the_state_dir(tmp_path, capsys):
+    """ROUND 2 MINOR: _snapshot_state used iterdir(), which raises
+    IsADirectoryError the moment a real state dir contains a subdir — and the
+    read-only proof must hold for exactly those dirs."""
+    day_old = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    state = _write_state(tmp_path, day_old)
+    nested = state / "archive"
+    nested.mkdir()
+    (nested / "2026-09-01.json").write_text("{}", encoding="utf-8")
+    before = _snapshot_state(state)          # must not raise
+    assert ("archive/2026-09-01.json", b"{}") in before
+    with _no_sweep_guard():
+        rc = _run_main(["fleet_report.py", "--no-sweep", "--state", str(state)])
+    out = capsys.readouterr().out
+    assert rc == 2 and "STALE DATA" in out
+    assert _snapshot_state(state) == before, "read-only proof covers subdirs too"
+
+
+def test_atomic_write_preserves_0644_store_permissions(tmp_path):
+    """ROUND 2 MINOR: mkstemp creates the temp file 0600, silently tightening
+    the store's historical 0644 for every secondary reader."""
+    from fleettools.fleet_report import _atomic_write_json
+    p = tmp_path / "fleet-verdicts.json"
+    _atomic_write_json(p, {"ts": "x", "results": []})
+    assert oct(p.stat().st_mode & 0o777) == "0o644"
 
 
 def test_no_sweep_stale_json_exits_2_stdout_still_valid_json(
@@ -366,7 +560,7 @@ def test_no_sweep_footer_names_the_served_file_not_a_heartbeat(
     with _no_sweep_guard():
         rc = _run_main(["fleet_report.py", "--no-sweep", "--state", str(state)])
     out = capsys.readouterr().out
-    assert rc == 0
+    assert rc == 2, "stale serve signals rc=2 in text mode too (README table)"
     foot = [l for l in out.splitlines() if "agents need attention" in l]
     assert foot, "footer line missing"
     assert "fleet-verdicts.json" in foot[0]
@@ -388,7 +582,7 @@ def test_no_sweep_does_not_replay_stored_changed_fields(tmp_path, capsys):
         rc = _run_main(["fleet_report.py", "--no-sweep", "--quiet",
                         "--state", str(state)])
     out = capsys.readouterr().out
-    assert rc == 0
+    assert rc == 2, "stale serve signals rc=2 in text mode too (README table)"
     assert "was CURRENT" not in out, "stored 'changed' fields must not replay"
     assert "UNREACHABLE" in out, "a problem agent is still spoken for"
     assert _snapshot_state(state) == before

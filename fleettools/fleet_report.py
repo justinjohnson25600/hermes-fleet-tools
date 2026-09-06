@@ -321,13 +321,44 @@ VERDICTS_FILENAME = "fleet-verdicts.json"
 HEARTBEAT_FILENAME = "fleet-heartbeat.json"
 
 
+# The full per-record key set render_report() reads unconditionally. ONE
+# tuple feeds BOTH the store validator (load_stored_verdicts) and the
+# renderer, so the two can never drift apart again: round 2 found the
+# validator checking only name/verdict while render indexed head/behind/
+# ahead/stashes/dirty, so a minimal record {"name": ..., "verdict": ...}
+# passed validation and died with KeyError 'head' AFTER the banner.
+RENDER_REQUIRED_KEYS = ("name", "verdict", "head", "behind", "ahead",
+                        "stashes", "dirty")
+
+# Text-table columns in print order: (key, width, label, right-align). The
+# renderer builds its header and rows FROM this spec, and the assert below
+# welds it to RENDER_REQUIRED_KEYS: add a column the table renders without
+# adding its key to the validated set (or vice versa) and import fails —
+# the drift that caused the round-2 KeyError becomes impossible.
+_RENDER_COLUMNS = (
+    ("head",    13, "head",   False),
+    ("behind",   6, "behind", True),
+    ("ahead",    5, "ahead",  True),
+    ("stashes",  5, "stash",  True),
+    ("dirty",    5, "dirty",  True),
+)
+assert {c[0] for c in _RENDER_COLUMNS} | {"name", "verdict"} == set(
+    RENDER_REQUIRED_KEYS), "render columns and validated keys drifted apart"
+
+
 def _atomic_write_json(path: Path, obj) -> None:
-    """Write JSON so a crash never leaves a torn or stale-but-paired file.
+    """Write JSON so a PROCESS CRASH never leaves a torn or stale-but-paired file.
 
     A plain write_text truncates the file first: a crash mid-write leaves a
     zero-byte store that looks exactly like 'no verdicts'. tempfile + rename
-    is atomic on POSIX and Windows: readers see the old file or the new one,
-    never a half-written one.
+    is atomic against process crashes on POSIX and Windows: readers see the
+    old file or the new one, never a half-written one.
+
+    Durability boundary (review round 2, deliberate): the file is fsynced but
+    the parent directory is NOT, so a full OS power loss may lose the rename
+    on some filesystems. Dir-fsync is not portable to the Windows control
+    boxes this tool runs from; process-crash atomicity is the guarantee on
+    sale, and the docstring now says so instead of implying more.
     """
     import tempfile
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name, suffix=".tmp")
@@ -336,6 +367,10 @@ def _atomic_write_json(path: Path, obj) -> None:
             json.dump(obj, fh, indent=2)
             fh.flush()
             os.fsync(fh.fileno())
+        # mkstemp creates the temp file 0600; this store has always shipped
+        # 0644 and secondary readers (other accounts, archive tooling) depend
+        # on that — an atomic rewrite must not silently tighten permissions.
+        os.chmod(tmp, 0o644)
         os.replace(tmp, path)
     except BaseException:
         try:
@@ -353,9 +388,9 @@ def load_stored_verdicts(path: Path) -> tuple[list[dict], str | None]:
     (a bare list) has no embedded ts; the caller falls back to file mtime.
 
     Raises ValueError with a one-line, human-readable message on any shape
-    problem, including elements that are not dicts carrying 'name' and
-    'verdict' — a store like ``["a", "b"]`` must die as a clean error line,
-    never a KeyError traceback after the table header.
+    problem. Records are validated against RENDER_REQUIRED_KEYS — the same
+    tuple render_report() consumes — so anything that would die as a KeyError
+    traceback after the banner dies here as a clean error line instead.
     """
     raw = json.loads(path.read_text(encoding="utf-8"))
     if isinstance(raw, dict):
@@ -364,11 +399,40 @@ def load_stored_verdicts(path: Path) -> tuple[list[dict], str | None]:
         results, ts = raw, None
     if not isinstance(results, list) or not results:
         raise ValueError("not a non-empty list of results")
-    for r in results:
-        if not isinstance(r, dict) or "name" not in r or "verdict" not in r:
+    for i, r in enumerate(results):
+        if not isinstance(r, dict):
+            raise ValueError(f"results[{i}] must be an object, not {type(r).__name__}")
+        if not isinstance(r.get("name"), str) or not r["name"]:
+            raise ValueError(f"results[{i}].name must be a non-empty string")
+        missing = [k for k in RENDER_REQUIRED_KEYS if k not in r]
+        if missing:
             raise ValueError(
-                "results[...] must be objects with 'name' and 'verdict' fields")
+                f"results[{i}] is missing field(s) the report renders: "
+                + ", ".join(missing))
     return results, ts if isinstance(ts, str) else None
+
+
+def _age_h_from_capture(ts: str | None, mtime: float | None) -> float | None:
+    """Age in hours from an ALREADY-CAPTURED (ts, mtime) pair; None if unknowable.
+
+    Shared by verdicts_age_h (which captures for itself) and
+    serve_stored_state (which must age the exact bytes it serves — see the
+    TOCTOU note there). A corrupt embedded ts falls through to mtime: the
+    store proved readable, only the stamp is garbage, so the age is not
+    unknowable.
+    """
+    if ts is not None:
+        try:
+            stamped = datetime.fromisoformat(ts)
+        except ValueError:
+            stamped = None
+        if stamped is not None:
+            if stamped.tzinfo is None:
+                stamped = stamped.replace(tzinfo=timezone.utc)
+            return max(0.0, (datetime.now(timezone.utc) - stamped).total_seconds() / 3600.0)
+    if mtime is None:
+        return None
+    return max(0.0, (datetime.now(timezone.utc).timestamp() - mtime) / 3600.0)
 
 
 def verdicts_age_h(state_dir: Path) -> float | None:
@@ -388,12 +452,7 @@ def verdicts_age_h(state_dir: Path) -> float | None:
             _, ts = load_stored_verdicts(vpath)
         except (OSError, ValueError):
             pass
-        if ts is not None:
-            stamped = datetime.fromisoformat(ts)
-            if stamped.tzinfo is None:
-                stamped = stamped.replace(tzinfo=timezone.utc)
-            return max(0.0, (datetime.now(timezone.utc) - stamped).total_seconds() / 3600.0)
-        return max(0.0, (datetime.now(timezone.utc).timestamp() - vpath.stat().st_mtime) / 3600.0)
+        return _age_h_from_capture(ts, vpath.stat().st_mtime)
     except (OSError, ValueError):
         return None
 
@@ -410,9 +469,11 @@ def emit_staleness_banner(state_dir, max_age_mins=180, stream=None,
 
     Returns True iff the banner fired, so callers can turn staleness into an
     exit code (JSON consumers cannot see stderr). Fail-open by design on
-    unknowable age (no file, unparseable ts, unreadable dir): an unknown age
-    is not a false one. That condition has a different owner (the deadman
-    cron) and must not cry wolf here.
+    unknowable age (no file, unreadable store): an unknown age is not a
+    false one. That condition has a different owner (the deadman cron) and
+    must not cry wolf here. A readable store with a corrupt embedded ts is
+    NOT unknowable — age falls back to file mtime (round 2: it used to fail
+    open, letting a 24h-old corrupt store serve as rc=0 fresh).
     """
     out = stream if stream is not None else sys.stdout
     if age_h is None:
@@ -444,15 +505,22 @@ def render_report(results: list[dict], state_dir: Path, quiet: bool = False,
         return 0
 
     width = max(len(r["name"]) for r in results)
-    print(f"{'agent'.ljust(width)}  {'verdict':11} {'head':13} {'behind':>6} {'ahead':>5} "
-          f"{'stash':>5} {'dirty':>5}  notes")
+
+    def cell(r, key, w, right):
+        v = r[key]
+        if right:                       # numeric columns: only None is '-'
+            return (str(v) if v is not None else "-").rjust(w)
+        return (str(v) if v else "-").ljust(w)   # head: '' renders as '-'
+
+    header = f"{'agent'.ljust(width)}  {'verdict':11} " + " ".join(
+        label.rjust(w) if right else label.ljust(w)
+        for _k, w, label, right in _RENDER_COLUMNS) + "  notes"
+    print(header)
     print("-" * (width + 78))
     for r in sorted(results, key=lambda x: (x["verdict"] not in PROBLEM_VERDICTS, x["name"])):
-        print(f"{r['name'].ljust(width)}  {r['verdict']:11} {r['head'] or '-':13} "
-              f"{str(r['behind']) if r['behind'] is not None else '-':>6} "
-              f"{str(r['ahead']) if r['ahead'] is not None else '-':>5} "
-              f"{str(r['stashes']) if r['stashes'] is not None else '-':>5} "
-              f"{str(r['dirty']) if r['dirty'] is not None else '-':>5}  "
+        cells = " ".join(
+            cell(r, key, w, right) for key, w, _label, right in _RENDER_COLUMNS)
+        print(f"{r['name'].ljust(width)}  {r['verdict']:11} {cells}  "
               f"{(r.get('reasons') or [''])[0]}")
         for reason in (r.get("reasons") or [])[1:]:
             print(f"{' ' * (width + 44)}{reason}")
@@ -498,31 +566,44 @@ def serve_stored_state(args) -> int:
               file=sys.stderr)
         return 1
     try:
+        # Read the store ONCE and capture its mtime alongside: everything
+        # below (banner, table, JSON) is derived from this single snapshot.
+        # Re-reading inside emit_staleness_banner was a TOCTOU: a sweep
+        # landing between the two reads replaced the store with a fresh one,
+        # and the banner labelled the OLD results we still serve with the NEW
+        # timestamp (review round 2). Ageing the captured bytes closes it.
         results, served_ts = load_stored_verdicts(prev_path)
+        served_mtime = prev_path.stat().st_mtime
     except (OSError, ValueError) as exc:
         print(f"fleet_report: stored verdicts unreadable ({exc})", file=sys.stderr)
         return 1
 
     # A stored report is a replay, not a live observation: 'changed'/'previous_verdict'
     # were computed against the state of the world one sweep ago and must not be
-    # re-announced as if they just happened.
+    # re-announced as if they just happened. Reset in place (not popped) so the
+    # --json schema keeps its keys with inert values instead of silently
+    # dropping fields between a sweep and a replay.
     for r in results:
-        r.pop("changed", None)
-        r.pop("previous_verdict", None)
+        r["changed"] = False
+        r["previous_verdict"] = None
 
     # Staleness first, before any table, so a reader can never mistake an
     # old sweep for a current one (2026-09-03). Unconditional w.r.t. --quiet:
     # stale data is signal. In --json mode stdout must stay valid JSON, so
     # the banner goes to stderr there — and staleness also becomes rc=2,
-    # because rc is the only channel a JSON consumer reliably reads.
+    # because rc is the only channel a JSON consumer reliably reads. rc=2
+    # applies to BOTH modes: the README exit-code table is mode-unqualified
+    # and text mode must honour it too (round 2: only --json returned 2).
     bannered = emit_staleness_banner(
         state_dir, max_age_mins=args.max_age_mins,
-        stream=sys.stderr if args.json else sys.stdout)
+        stream=sys.stderr if args.json else sys.stdout,
+        age_h=_age_h_from_capture(served_ts, served_mtime))
 
     if args.json:
         print(json.dumps(results, indent=2))
         return 2 if bannered else 0
-    return render_report(results, state_dir, quiet=args.quiet, served_ts=served_ts)
+    rc = render_report(results, state_dir, quiet=args.quiet, served_ts=served_ts)
+    return 2 if bannered else rc
 
 
 def main() -> int:

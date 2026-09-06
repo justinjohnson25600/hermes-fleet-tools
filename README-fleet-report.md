@@ -111,7 +111,9 @@ the banner's only home.
 
 Age comes from the timestamp the sweep stamps **inside
 `state/fleet-verdicts.json`** (`{"ts": ..., "results": [...]}`), with the
-file's mtime as the fallback for stores written before that shape existed.
+file's mtime as the fallback — for stores written before that shape existed,
+and for a readable store whose embedded ts is corrupt (a garbage stamp is
+not an unknowable age).
 The heartbeat is never consulted for staleness: it is a liveness
 side-channel and can be missing (or stale) while the verdicts it vouched
 for are a day old — exactly the 2026-09-03 incident class.
@@ -131,8 +133,11 @@ unreachable guard is guard deletion. So:
 
 `--no-sweep` is read-only: no probing, no state writes. Missing stored
 verdicts are a visible failure (`exit 1`, message on stderr), never silence.
-A malformed store (wrong shape, or elements missing `name`/`verdict`) is
-likewise a one-line stderr message, never a traceback.
+A malformed store (wrong shape, a non-string `name`, or a record missing any
+field the report renders) is likewise a one-line stderr message, never a
+traceback. The rendered field set is defined in ONE place
+(`RENDER_REQUIRED_KEYS`) shared by the validator and the renderer, so the
+two cannot drift apart.
 
 **Exit codes for `--no-sweep`:**
 
@@ -144,7 +149,8 @@ likewise a one-line stderr message, never a traceback.
 
 With `--json`, stdout stays valid JSON and the banner goes to stderr; the
 staleness signal for JSON consumers is **`rc=2`**, since a pipe consumer of
-stdout never sees stderr.
+stdout never sees stderr. `rc=2` applies to text mode too — the table above
+is deliberately mode-unqualified.
 
 ## Cron mode and the silence contract
 
@@ -183,7 +189,7 @@ it with a deadman check that speaks when the heartbeat ages past ~26h.
 ## Tests
 
 ```bash
-python3 -m pytest tests/ -q      # 42 tests
+python3 -m pytest tests/ -q      # 53 tests
 ```
 
 Fixtures are real captured output, not invented strings. Tests named
