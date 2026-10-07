@@ -289,6 +289,8 @@ def main() -> int:
     print()
     counts, failed = [], []
     seen_hosts: dict[str, str] = {}
+    # Check counts are only comparable between nodes of the same OS.
+    agent_by_name = {a["name"]: a for a in targets}
     for name, r in results:
         if r.get("error"):
             print(f"  FAIL {name}: {r['error'][:160]}")
@@ -316,16 +318,36 @@ def main() -> int:
         if t.get("failed"):
             failed.append(name)
         if "passed" in t:
-            counts.append((name, t["passed"]))
+            counts.append((name, t["passed"], (agent_by_name.get(name, {}) or {}).get("platform") or "unknown"))
 
-    # A lower check count than the best agent means checks are SKIPPING there.
+    # A lower check count than its PEERS means checks are SKIPPING there.
+    #
+    # Compare within a platform, never across. A suite legitimately runs a
+    # different number of checks per OS when assertions are guarded by
+    # os.name/sys.platform (argv-limit checks, for example, only exist on
+    # Windows), so a global max makes every node of the smaller-count platform
+    # warn forever on a perfectly correct install — and a guard that cries wolf
+    # on a correct fleet trains the reader to ignore the warnings that matter.
     if counts:
-        best = max(c for _, c in counts)
-        for name, c in counts:
-            if c < best:
-                print(f"  WARN {name}: {c} checks vs {best} elsewhere — checks are being "
-                      f"skipped, not passing. Investigate before trusting this install.")
-                failed.append(name)
+        by_platform = {}
+        for name, c, plat in counts:
+            by_platform.setdefault(plat, []).append((name, c))
+        for plat, group in sorted(by_platform.items()):
+            best = max(c for _, c in group)
+            for name, c in group:
+                if c < best:
+                    peers = ", ".join(sorted(n for n, cc in group if cc == best))
+                    print(f"  WARN {name}: {c} checks vs {best} on the same platform "
+                          f"({plat}: {peers}) — checks are being skipped, not passing. "
+                          f"Investigate before trusting this install.")
+                    failed.append(name)
+        # Cross-platform differences are reported as information, not failure:
+        # worth seeing (a real skip could hide here) but not actionable alone.
+        tops = {plat: max(c for _, c in group) for plat, group in by_platform.items()}
+        if len(set(tops.values())) > 1:
+            spread = ", ".join(f"{p}={c}" for p, c in sorted(tops.items()))
+            print(f"  note: check counts differ by platform ({spread}) — expected when "
+                  f"assertions are platform-guarded; confirm the delta is explained.")
 
     if failed:
         print(f"\n{len(set(failed))} agent(s) need attention: {', '.join(sorted(set(failed)))}")
