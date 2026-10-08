@@ -109,7 +109,11 @@ for s in SKILLS:
     p = subprocess.run([sys.executable, str(tmp), s], capture_output=True, text=True, timeout=900)
     rep["skills"][s] = {"rc": p.returncode, "err": (p.stderr or "").strip()[-200:] if p.returncode else ""}
 
-# stale copies: anything outside the canonical category dir (and the stray state dir)
+# stale copies: anything outside the canonical category dir and outside
+# profiles/ (the stray top-level skill dir from the pre-split layout).
+# Per-profile copies are NOT stale by location: a named-profile session never
+# falls back to the default home's skills, so each profile needs its own copy
+# of the prompt files — they are reconciled by content below, not deleted.
 cleaned = []
 if not DRY:
     for s in SKILLS:
@@ -119,10 +123,50 @@ if not DRY:
         if stray.is_file() and canon and stray != canon:
             shutil.rmtree(HOME / s, ignore_errors=True); cleaned.append(str(stray))
         for f in list(_walk(HOME, "%%s/SKILL.md" %% s)):
-            if "backups" in str(f) or f == canon:
+            if "backups" in str(f) or f == canon or "profiles" in f.parts:
                 continue
             shutil.rmtree(f.parent, ignore_errors=True); cleaned.append(str(f))
 rep["cleaned"] = cleaned
+
+# per-profile visibility: seed every profile's skills dir from the canonical
+# install (same content), skipping deliberate opt-outs. A copy that already
+# matches is left alone; one that differs (old version or the pre-split layout
+# with code files inside) is replaced. Profile-local state (devpair/config.json)
+# is never touched — only the prompt files are managed.
+seeded, pruned_profiles = [], []
+if not DRY:
+    prof_root = HOME / "profiles"
+    for s in SKILLS:
+        canon = list(HOME.glob("skills/*/%%s/SKILL.md" %% s))
+        canon = canon[0] if canon else None
+        if canon is None:
+            continue
+        body = canon.read_bytes()
+        rel = canon.parent.relative_to(HOME / "skills")
+        for prof in sorted(prof_root.iterdir()) if prof_root.is_dir() else []:
+            if not prof.is_dir() or prof.name.startswith("."):
+                continue
+            if (prof / ".no-bundled-skills").exists():
+                continue
+            dst = prof / "skills" / rel
+            cur = dst / "SKILL.md"
+            try:
+                if cur.is_file() and cur.read_bytes() == body:
+                    continue
+                if cur.is_file():
+                    shutil.rmtree(dst, ignore_errors=True); pruned_profiles.append(str(cur))
+                dst.mkdir(parents=True, exist_ok=True)
+                for f in canon.parent.iterdir():
+                    if f.is_file():
+                        shutil.copy2(f, dst / f.name)
+                for sub in canon.parent.iterdir():
+                    if sub.is_dir() and not sub.name.startswith("."):
+                        shutil.copytree(sub, dst / sub.name, dirs_exist_ok=True)
+                seeded.append(str(dst))
+            except OSError as e:
+                pruned_profiles.append("ERR %%s: %%s" %% (prof.name, e))
+rep["seeded_profiles"] = seeded
+rep["pruned_profiles"] = pruned_profiles
 
 for s in SKILLS:
     hits = [f for f in _walk(HOME, "%%s/SKILL.md" %% s) if "backups" not in str(f)]
