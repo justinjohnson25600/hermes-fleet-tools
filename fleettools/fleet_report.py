@@ -65,23 +65,33 @@ Write-Output '===GIT==='
 # and report every agent as BLOCKED. Expand to the PowerShell equivalent here.
 $repo = '@@REPO@@'
 $repo = [System.Environment]::ExpandEnvironmentVariables($repo)
+# pm-era installs keep git under tools\<entry>\cmd and NOT on PATH (ascend-ai, 2026-10-11: bare
+# 'git' failed, so HEAD was unreadable and the nightly reported UNKNOWN). Resolve it the way the
+# FleetOps worker does: the install's own tools\facts.json first, then PATH.
+$git = 'git'
+$facts = Join-Path (Split-Path $repo -Parent) 'tools\facts.json'
+if (Test-Path -LiteralPath $facts) {
+  $entry = (Get-Content -LiteralPath $facts -Raw | ConvertFrom-Json).packages.git.entry
+  if ($entry) { $cand = Join-Path (Split-Path $repo -Parent) "tools\$entry\cmd\git.exe"
+    if (Test-Path -LiteralPath $cand) { $git = $cand } }
+}
 if (Test-Path $repo) {
   Push-Location $repo
-  Write-Output ('HEAD='       + (git rev-parse HEAD 2>&1))
-  Write-Output ('UPSTREAM='   + (git rev-parse '@{u}' 2>&1))
-  Write-Output ('BRANCH='     + (git rev-parse --abbrev-ref HEAD 2>&1))
-  Write-Output ('SHALLOW='    + (git rev-parse --is-shallow-repository 2>&1))
-  Write-Output ('BEHIND='     + (git rev-list --count 'HEAD..@{u}' 2>&1))
-  Write-Output ('AHEAD='      + (git rev-list --count '@{u}..HEAD' 2>&1))
-  Write-Output ('MERGEBASE='  + (git merge-base HEAD '@{u}' 2>&1))
-  Write-Output ('STASHES='    + ((git stash list 2>&1 | Measure-Object -Line).Lines))
-  Write-Output ('DIRTY='      + ((git status --porcelain 2>&1 | Measure-Object -Line).Lines))
+  Write-Output ('HEAD='       + (& $git rev-parse HEAD 2>&1))
+  Write-Output ('UPSTREAM='   + (& $git rev-parse '@{u}' 2>&1))
+  Write-Output ('BRANCH='     + (& $git rev-parse --abbrev-ref HEAD 2>&1))
+  Write-Output ('SHALLOW='    + (& $git rev-parse --is-shallow-repository 2>&1))
+  Write-Output ('BEHIND='     + (& $git rev-list --count 'HEAD..@{u}' 2>&1))
+  Write-Output ('AHEAD='      + (& $git rev-list --count '@{u}..HEAD' 2>&1))
+  Write-Output ('MERGEBASE='  + (& $git merge-base HEAD '@{u}' 2>&1))
+  Write-Output ('STASHES='    + ((& $git stash list 2>&1 | Measure-Object -Line).Lines))
+  Write-Output ('DIRTY='      + ((& $git status --porcelain 2>&1 | Measure-Object -Line).Lines))
   # A branch with no upstream cannot answer @{u}. Fall back to the default
   # remote branch so a deliberately-patched checkout still reports real drift
   # instead of collapsing to UNKNOWN.
-  Write-Output ('ORIGINHEAD=' + (git rev-parse origin/main 2>&1))
-  Write-Output ('BEHINDORIGIN=' + (git rev-list --count 'HEAD..origin/main' 2>&1))
-  Write-Output ('AHEADORIGIN='  + (git rev-list --count 'origin/main..HEAD' 2>&1))
+  Write-Output ('ORIGINHEAD=' + (& $git rev-parse origin/main 2>&1))
+  Write-Output ('BEHINDORIGIN=' + (& $git rev-list --count 'HEAD..origin/main' 2>&1))
+  Write-Output ('AHEADORIGIN='  + (& $git rev-list --count 'origin/main..HEAD' 2>&1))
   Pop-Location
 } else { Write-Output 'REPO_MISSING=1' }
 Write-Output '===DESKTOP==='
@@ -165,6 +175,21 @@ def _int(value: str | None):
     return int(value) if value and value.strip().isdigit() else None
 
 
+def release_verdict(check: str) -> str | None:
+    """The node CLI's own release-channel verdict from `hermes update --check`.
+
+    "current"   — "No newer release" (holding past the release) or "Up to date with the latest
+                  release"; "available" — "Selected release available"; None — a branch channel
+                  (or an older CLI) that reports in commits, which the git arithmetic handles.
+    Matched on the ASCII text so a console that mangles the leading check mark still parses.
+    """
+    if "No newer release" in check or "Up to date with the latest release" in check:
+        return "current"
+    if "Selected release available" in check:
+        return "available"
+    return None
+
+
 def classify(rec: dict) -> tuple[str, list[str]]:
     """Return (verdict, reasons). Anything not understood is UNKNOWN, not CURRENT."""
     if rec.get("error"):
@@ -219,6 +244,28 @@ def classify(rec: dict) -> tuple[str, list[str]]:
         if prose:
             reasons.append(f"CLI reports {prose.group(1)} behind (advisory)")
         return SHALLOW, reasons
+
+    # Fleet policy since 2026-10-10 is STABLE releases, moving forward-only: a node lands on the
+    # latest release (as a DETACHED HEAD at the release commit, so @{u} does not resolve) or
+    # holds where it is when already past it. On that channel "behind origin/main" is the correct
+    # state, so the node's own `hermes update --check` verdict decides, ahead of the upstream
+    # arithmetic below. Local commits still make a node DIVERGED.
+    release = release_verdict(check)
+    if release:
+        a_org, b_org = _int(git.get("AHEADORIGIN")), _int(git.get("BEHINDORIGIN"))
+        if a_org is None:
+            return UNKNOWN, ["release channel, but origin/main..HEAD was unreadable"]
+        if a_org:
+            return DIVERGED, [f"{a_org} local commit(s) not in origin/main"]
+        stashes, dirty = _int(git.get("STASHES")), _int(git.get("DIRTY"))
+        if stashes:
+            reasons.append(f"{stashes} stash(es)")
+        if dirty:
+            reasons.append(f"{dirty} dirty file(s)")
+        if release == "available":
+            return BEHIND, ["a newer release is available on this node's channel"] + reasons
+        held = f"; {b_org} commit(s) behind main, as stable expects" if b_org else ""
+        return CURRENT, [f"release channel: no newer release{held}"] + reasons
 
     if not upstream or len(upstream) < 40:
         # No upstream ref. On this estate that means a deliberately-patched
