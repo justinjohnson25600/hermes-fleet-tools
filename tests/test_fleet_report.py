@@ -575,12 +575,20 @@ def test_no_sweep_legacy_store_bytes_and_mtime_come_from_the_same_fd(
             {"ts": fresh, "results": [dict(HEALTHY_RESULT,
                                            head="ffffffffffff")]}),
             encoding="utf-8")
-        os.replace(tmp, path)
+        try:
+            os.replace(tmp, path)
+        except PermissionError:
+            # Windows denies replacing an open CRT descriptor. The writer
+            # failed, but the reader must still serve its original stale data.
+            if os.name != "nt":
+                raise
+            tmp.unlink()
 
     with _no_sweep_guard(), \
          mock.patch.object(fr.os, "open", side_effect=racing_open):
         rc = _run_main(["fleet_report.py", "--no-sweep", "--state", str(state)])
     out = capsys.readouterr().out
+    assert raced["done"], "the competing rewrite must actually be attempted"
     assert "STALE DATA" in out and "24" in out, (
         "the served day-old bytes must be bannered with the mtime captured "
         "from the SAME fd, even though the path now holds a fresh sweep")
