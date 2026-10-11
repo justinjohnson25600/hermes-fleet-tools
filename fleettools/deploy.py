@@ -170,8 +170,16 @@ rep["pruned_profiles"] = pruned_profiles
 
 for s in SKILLS:
     hits = [f for f in _walk(HOME, "%%s/SKILL.md" %% s) if "backups" not in str(f)]
-    rep["skills"].setdefault(s, {})["version"] = ver(hits[0]) if hits else None
+    # Report the canonical copy. Walk order put profiles/ before skills/, so an
+    # opted-out profile still holding an old copy was reported as the install.
+    canon = list(HOME.glob("skills/*/%%s/SKILL.md" %% s))
+    main = canon[0] if canon else (hits[0] if hits else None)
+    v = ver(main) if main else None
+    rep["skills"].setdefault(s, {})["version"] = v
     rep["skills"][s]["copies"] = len(hits)
+    others = sorted({ver(f) for f in hits if f != main} - {v, None})
+    if others:
+        rep["skills"][s]["other_versions"] = others
 
 t = HOME / "devpair" / "test_devpair.py"
 if t.is_file() and not DRY:
@@ -247,17 +255,70 @@ def wait_for_cdn(skills: list[str], timeout: int = 420) -> dict:
         time.sleep(20)
 
 
+_RESOLVE_PY = r'''
+$pin = '%(pin)s'
+$h = if ($env:HERMES_HOME) { $env:HERMES_HOME } else { Join-Path $env:LOCALAPPDATA 'hermes' }
+$c = @()
+if ($pin) { $c += $pin }
+$c += (Join-Path $h 'hermes-agent\venv\Scripts\python.exe')
+$c += (Get-ChildItem (Join-Path $h 'installs') -Recurse -Depth 6 -Filter python.exe -ErrorAction SilentlyContinue |
+       Where-Object { $_.FullName -match '\\environments\\[^\\]+\\venv\\Scripts\\python\.exe$' } |
+       Sort-Object LastWriteTime -Descending | ForEach-Object { $_.FullName })
+$py = Get-Command py -ErrorAction SilentlyContinue
+if ($py) { $c += (& $py.Source -3 -c "import sys; print(sys.executable)" 2>$null) }
+$sys = Get-Command python -ErrorAction SilentlyContinue
+if ($sys -and $sys.Source -notmatch '\\WindowsApps\\') { $c += $sys.Source }
+foreach ($p in $c) {
+  if (-not $p -or -not (Test-Path $p)) { continue }
+  $out = & $p -c "import sys; print(sys.version_info >= (3, 8))" 2>$null
+  if ("$out".Trim() -eq 'True') { "PY=" + $p; exit 0 }
+}
+"PY="
+'''
+
+
+def resolve_python(host: str, pinned: str | None) -> tuple[str | None, str]:
+    """A working interpreter on a remote Windows box, and a note if the pin
+    could not be used.
+
+    A Hermes update replaces the environment a pin points into, and a box with
+    no pin has only the Microsoft Store stub as `python`. Either way the deploy
+    used to fail with "The system cannot find the path specified". The pin
+    still wins while it works; otherwise take what the box has now and say so.
+    """
+    script = _RESOLVE_PY % {"pin": (pinned or "").replace("'", "''")}
+    enc = base64.b64encode(script.encode("utf-16-le")).decode()
+    try:
+        r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", host,
+                            f"powershell -NoProfile -NonInteractive -EncodedCommand {enc}"],
+                           capture_output=True, text=True, timeout=180, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return pinned, "interpreter probe timed out; using the roster pin as-is"
+    m = re.search(r"^PY=(.*)$", r.stdout or "", re.M)
+    found = (m.group(1).strip() if m else "") or None
+    if not found:
+        return None, "no Python 3.8+ found (pin, Hermes venvs, py launcher, PATH)"
+    if pinned and os.path.normcase(found) != os.path.normcase(pinned):
+        return found, f"roster pin {pinned} no longer runs; used {found}. Update the roster pin."
+    return found, ""
+
+
 def deliver(agent: dict, skills: list[str], dry: bool) -> tuple[str, dict]:
     name, host = agent["name"], agent["host"]
     code = REMOTE % {"raw": RAW, "skills": skills, "dry": dry}
     # Not every Windows box has a usable `python` on PATH. Some have only the
     # Microsoft Store alias stub, which prints an install advert and exits 9009
-    # instead of running anything. An agent may therefore pin its interpreter.
+    # instead of running anything. An agent may therefore pin its interpreter,
+    # and resolve_python() falls back when that pin has gone stale.
     py = agent.get("python") or "python"
+    note = ""
     if host == "local":
         p = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=1800)
         out = p.stdout
     else:
+        py, note = resolve_python(host, agent.get("python"))
+        if not py:
+            return name, {"error": note}
         b64 = base64.b64encode(code.encode()).decode()
         writer = (f'"{py}" -c "import base64,os,sys;'
                   "open(os.environ['TEMP']+chr(92)+'_hsdeploy.py','wb')"
@@ -270,9 +331,12 @@ def deliver(agent: dict, skills: list[str], dry: bool) -> tuple[str, dict]:
                            capture_output=True, text=True, timeout=1800)
         out = p.stdout
     try:
-        return name, json.loads(out)
+        rep = json.loads(out)
     except Exception:
         return name, {"error": (out or p.stderr or "no output")[-300:]}
+    if note:
+        rep["interp_note"] = note
+    return name, rep
 
 
 def main() -> int:
@@ -354,11 +418,21 @@ def main() -> int:
             failed.append(name)
         if ident:
             seen_hosts[ident] = name
-        vers = " ".join(f"{s}={d.get('version')}" for s, d in r.get("skills", {}).items())
+        vers = " ".join(f"{s}={d.get('version')}" + (f" (other copies: {','.join(d['other_versions'])})"
+                                                     if d.get("other_versions") else "")
+                        for s, d in r.get("skills", {}).items())
         t = r.get("tests") or {}
+        if "raw" in t:
+            # The suite ran but printed no summary: it crashed part-way. That is
+            # an unverified install, not an OK one.
+            print(f"  FAIL {name}: tests did not complete — {t['raw'][-140:]!r}")
+            failed.append(name)
+            continue
         tt = f"{t.get('passed')}/{t.get('passed', 0) + t.get('failed', 0)}" if "passed" in t else "-"
         extra = f" cleaned={len(r['cleaned'])}" if r.get("cleaned") else ""
         print(f"  OK   {name:<18} {vers}  tests={tt}{extra}")
+        if r.get("interp_note"):
+            print(f"       {'':<18} NOTE: {r['interp_note']}")
         if t.get("failed"):
             failed.append(name)
         if "passed" in t:
