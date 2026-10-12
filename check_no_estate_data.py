@@ -53,8 +53,9 @@ SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv"}
 TEXT_SUFFIXES = {".py", ".md", ".json", ".yaml", ".yml", ".txt", ".sh", ".toml", ".cfg", ""}
 
 
-def scan(root: Path) -> list[tuple[Path, int, str, str, str]]:
+def scan(root: Path) -> tuple[list[tuple[Path, int, str, str, str]], int]:
     findings = []
+    scanned = 0
     for path in sorted(root.rglob("*")):
         if not path.is_file() or any(p in SKIP_DIRS for p in path.parts):
             continue
@@ -66,19 +67,29 @@ def scan(root: Path) -> list[tuple[Path, int, str, str, str]]:
             lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
         except OSError:
             continue
+        scanned += 1
         for n, line in enumerate(lines, 1):
             for label, rx, why in PATTERNS:
                 m = rx.search(line)
                 if m and not ALLOW.search(line):
                     findings.append((path.relative_to(root), n, label, m.group(0), why))
-    return findings
+    return findings, scanned
 
 
 def main() -> int:
-    root = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
-    findings = scan(root)
+    args = sys.argv[1:]
+    # Fail closed: a typo'd flag or path used to be read as a directory that did not
+    # exist, rglob found nothing, and the guard printed "clean" without scanning.
+    if len(args) > 1 or (args and args[0].startswith("-")):
+        print("usage: check_no_estate_data.py [path]   (one existing directory; no flags)", file=sys.stderr)
+        return 2
+    root = Path(args[0] if args else ".").resolve()
+    if not root.is_dir():
+        print(f"check_no_estate_data: {root} is not a directory; nothing was scanned", file=sys.stderr)
+        return 2
+    findings, scanned = scan(root)
     if not findings:
-        print(f"clean: no estate identifiers found under {root.name}/")
+        print(f"clean: no estate identifiers found in {scanned} file(s) under {root.name}/")
         return 0
     print(f"{len(findings)} estate identifier(s) would be published:\n")
     for rel, n, label, hit, why in findings:
