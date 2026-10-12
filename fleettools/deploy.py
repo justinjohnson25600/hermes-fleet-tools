@@ -107,7 +107,12 @@ for s in SKILLS:
         rep["skills"][s] = {"dry_run": True}
         continue
     p = subprocess.run([sys.executable, str(tmp), s], capture_output=True, text=True, timeout=900)
-    rep["skills"][s] = {"rc": p.returncode, "err": (p.stderr or "").strip()[-200:] if p.returncode else ""}
+    # install.py logs to stdout, including "VERIFY FAILED" and the suite's "N passed, M failed".
+    out = (p.stdout or "") + (p.stderr or "")
+    rep["skills"][s] = {"rc": p.returncode, "err": out.strip()[-200:] if p.returncode else ""}
+    counts = re.findall(r"(\d+) passed, (\d+) failed", out)
+    if counts:
+        rep["skills"][s]["verify"] = {"passed": int(counts[-1][0]), "failed": int(counts[-1][1])}
 
 # stale copies: anything outside the canonical category dir and outside
 # profiles/ (the stray top-level skill dir from the pre-split layout).
@@ -192,6 +197,47 @@ except Exception:
     pass
 print(json.dumps(rep))
 '''
+
+
+def verify_counts(text: str) -> dict | None:
+    """The installer's last 'N passed, M failed' line, or None for a skill with no suite.
+    REMOTE carries the same parse inline: it runs on the box and cannot import this module."""
+    found = re.findall(r"(\d+) passed, (\d+) failed", text or "")
+    return {"passed": int(found[-1][0]), "failed": int(found[-1][1])} if found else None
+
+
+def _checks(v: dict | None) -> str:
+    return f" (checks {v['passed']}/{v['passed'] + v['failed']})" if v else ""
+
+
+def skill_failures(r: dict) -> list[str]:
+    """One message per delivered skill that did not install cleanly or failed its own checks.
+    A version on disk is not a working install: install.py exits 1 on VERIFY FAILED after the
+    files have landed."""
+    out = []
+    for s, d in (r.get("skills") or {}).items():
+        if d.get("dry_run"):
+            continue
+        v = d.get("verify")
+        if d.get("rc"):
+            msg = f"{s}: installer exited {d['rc']}{_checks(v)}"
+            if d.get("err"):
+                msg += f" -- {d['err'][-120:]}"
+            out.append(msg)
+        elif v and v["failed"]:
+            out.append(f"{s}: {v['failed']} check(s) failed{_checks(v)}")
+    return out
+
+
+def format_versions(r: dict) -> str:
+    """'skill=version (checks p/t) (other copies: ...)' for each delivered skill."""
+    parts = []
+    for s, d in (r.get("skills") or {}).items():
+        p = f"{s}={d.get('version')}{_checks(d.get('verify'))}"
+        if d.get("other_versions"):
+            p += f" (other copies: {','.join(d['other_versions'])})"
+        parts.append(p)
+    return " ".join(parts)
 
 
 def load_agents() -> dict:
@@ -418,9 +464,14 @@ def main() -> int:
             failed.append(name)
         if ident:
             seen_hosts[ident] = name
-        vers = " ".join(f"{s}={d.get('version')}" + (f" (other copies: {','.join(d['other_versions'])})"
-                                                     if d.get("other_versions") else "")
-                        for s, d in r.get("skills", {}).items())
+        bad = skill_failures(r)
+        if bad:
+            # The files may have landed, but the skill is not proven working there.
+            for msg in bad:
+                print(f"  FAIL {name}: {msg[:220]}")
+            failed.append(name)
+            continue
+        vers = format_versions(r)
         t = r.get("tests") or {}
         if "raw" in t:
             # The suite ran but printed no summary: it crashed part-way. That is
@@ -430,7 +481,7 @@ def main() -> int:
             continue
         tt = f"{t.get('passed')}/{t.get('passed', 0) + t.get('failed', 0)}" if "passed" in t else "-"
         extra = f" cleaned={len(r['cleaned'])}" if r.get("cleaned") else ""
-        print(f"  OK   {name:<18} {vers}  tests={tt}{extra}")
+        print(f"  OK   {name:<18} {vers}  dev-pair suite={tt}{extra}")
         if r.get("interp_note"):
             print(f"       {'':<18} NOTE: {r['interp_note']}")
         if t.get("failed"):
