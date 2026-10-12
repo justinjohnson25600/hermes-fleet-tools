@@ -105,6 +105,45 @@ def test_main_fails_the_box_whose_skill_failed_verify(monkeypatch, capsys):
     assert rc != 0
 
 
+def _run_main(monkeypatch, capsys, suites):
+    """Drive main() over Windows boxes whose dev-pair suite results are `suites` {name: (passed, failed)}."""
+    import fleettools.deploy as d
+    agents = [{"name": n, "platform": "windows", "enabled": True, "host": f"u@{n}", "role": "worker"}
+              for n in suites]
+    reports = {n: {"serial": n.upper(), "tests": {"passed": p, "failed": f},
+                   "skills": {"s": {"rc": 0, "err": "", "version": "0.0.1", "verify": {"passed": 9, "failed": 0}}}}
+               for n, (p, f) in suites.items()}
+    monkeypatch.setattr(d, "load_agents", lambda: {"agents": agents})
+    monkeypatch.setattr(d, "deliver", lambda a, skills, dry: (a["name"], reports[a["name"]]))
+    monkeypatch.setattr(sys, "argv", ["deploy.py", "s", "--no-wait"])
+    rc = d.main()
+    return rc, capsys.readouterr().out
+
+
+def test_a_failed_devpair_check_is_a_failure_not_ok_and_not_a_skip(monkeypatch, capsys):
+    # 589 passed + 1 failed = 590 run: nothing was skipped, one check failed. The old verdict printed
+    # this box as OK and warned "checks are being skipped", which sent the reader the wrong way.
+    rc, out = _run_main(monkeypatch, capsys, {"box-a": (589, 1), "box-b": (590, 0), "box-c": (590, 0)})
+    assert "FAIL box-a: dev-pair suite: 1 check(s) failed (589/590)" in out
+    assert "OK   box-a" not in out
+    assert "box-a: 589 checks vs 590" not in out
+    assert "OK   box-b" in out
+    assert rc != 0
+
+
+def test_a_real_skip_still_warns_against_same_platform_peers(monkeypatch, capsys):
+    rc, out = _run_main(monkeypatch, capsys, {"box-a": (559, 0), "box-b": (590, 0)})
+    assert "WARN box-a: 559 checks vs 590 on the same platform" in out
+    assert "checks are being skipped" in out
+    assert rc != 0
+
+
+def test_a_clean_fleet_exits_zero(monkeypatch, capsys):
+    rc, out = _run_main(monkeypatch, capsys, {"box-a": (590, 0), "box-b": (590, 0)})
+    assert "FAIL" not in out and "WARN" not in out
+    assert rc == 0
+
+
 def test_remote_script_end_to_end_reads_the_installers_stdout(tmp_path):
     # install.py logs to stdout; a remote script that read only stderr would lose every count.
     # Serve a fake installer over local HTTP and run REMOTE in a sandboxed Hermes home.

@@ -476,18 +476,24 @@ def main() -> int:
         if "raw" in t:
             # The suite ran but printed no summary: it crashed part-way. That is
             # an unverified install, not an OK one.
-            print(f"  FAIL {name}: tests did not complete — {t['raw'][-140:]!r}")
+            print(f"  FAIL {name}: dev-pair suite did not complete — {t['raw'][-140:]!r}")
             failed.append(name)
             continue
         tt = f"{t.get('passed')}/{t.get('passed', 0) + t.get('failed', 0)}" if "passed" in t else "-"
         extra = f" cleaned={len(r['cleaned'])}" if r.get("cleaned") else ""
-        print(f"  OK   {name:<18} {vers}  dev-pair suite={tt}{extra}")
+        if t.get("failed"):
+            # Every check ran and some failed: a failing install, not an OK one, and not a skip.
+            print(f"  FAIL {name}: dev-pair suite: {t['failed']} check(s) failed ({tt})  {vers}")
+            failed.append(name)
+        else:
+            print(f"  OK   {name:<18} {vers}  dev-pair suite={tt}{extra}")
         if r.get("interp_note"):
             print(f"       {'':<18} NOTE: {r['interp_note']}")
-        if t.get("failed"):
-            failed.append(name)
         if "passed" in t:
-            counts.append((name, t["passed"], (agent_by_name.get(name, {}) or {}).get("platform") or "unknown"))
+            # Checks RUN (passed + failed), not checks passed: only a smaller number of checks
+            # run means checks were skipped. Comparing passed counts reported a failure as a skip.
+            counts.append((name, t["passed"] + t.get("failed", 0),
+                           (agent_by_name.get(name, {}) or {}).get("platform") or "unknown"))
 
     # A lower check count than its PEERS means checks are SKIPPING there.
     #
