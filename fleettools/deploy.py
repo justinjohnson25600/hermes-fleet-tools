@@ -191,6 +191,10 @@ if t.is_file() and not DRY:
     p = subprocess.run([sys.executable, str(t)], capture_output=True, text=True, timeout=1200, cwd=str(t.parent))
     m = re.search(r"(\d+) passed, (\d+) failed", p.stdout or "")
     rep["tests"] = {"passed": int(m.group(1)), "failed": int(m.group(2))} if m else {"raw": (p.stdout or "")[-120:]}
+    # Name the failing checks: an intermittent failure reported only as a count cannot be traced later.
+    fails = [l.strip()[:200] for l in (p.stdout or "").splitlines() if l.lstrip().startswith("FAIL ")][:5]
+    if fails:
+        rep["tests"]["fail_lines"] = fails
 try:
     tmp.unlink()
 except Exception:
@@ -484,6 +488,8 @@ def main() -> int:
         if t.get("failed"):
             # Every check ran and some failed: a failing install, not an OK one, and not a skip.
             print(f"  FAIL {name}: dev-pair suite: {t['failed']} check(s) failed ({tt})  {vers}")
+            for line in t.get("fail_lines") or []:
+                print(f"       {'':<18} {line}")
             failed.append(name)
         else:
             print(f"  OK   {name:<18} {vers}  dev-pair suite={tt}{extra}")

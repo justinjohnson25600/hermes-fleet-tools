@@ -144,6 +144,46 @@ def test_a_clean_fleet_exits_zero(monkeypatch, capsys):
     assert rc == 0
 
 
+def test_the_failed_devpair_check_is_named_in_the_verdict(monkeypatch, capsys):
+    # An intermittent failure that only reports a count cannot be traced afterwards.
+    import fleettools.deploy as d
+    agents = [{"name": "box-a", "platform": "windows", "enabled": True, "host": "u@a", "role": "worker"}]
+    rep = {"serial": "A", "skills": {},
+           "tests": {"passed": 589, "failed": 1,
+                     "fail_lines": ["FAIL  ledger keeps every line under concurrency  — 3 of 4 lines"]}}
+    monkeypatch.setattr(d, "load_agents", lambda: {"agents": agents})
+    monkeypatch.setattr(d, "deliver", lambda a, skills, dry: (a["name"], rep))
+    monkeypatch.setattr(sys, "argv", ["deploy.py", "s", "--no-wait"])
+    rc = d.main()
+    out = capsys.readouterr().out
+    assert "FAIL box-a: dev-pair suite: 1 check(s) failed" in out
+    assert "ledger keeps every line under concurrency  — 3 of 4 lines" in out
+    assert rc != 0
+
+
+def test_remote_script_captures_the_failing_devpair_check_names(tmp_path):
+    srv = tmp_path / "srv"
+    srv.mkdir()
+    (srv / "install.py").write_text("print('[install] verify passed.')\n", encoding="utf-8")
+    home = tmp_path / "home"
+    (home / "devpair").mkdir(parents=True)
+    (home / "devpair" / "test_devpair.py").write_text(
+        "print('  PASS  a')\n"
+        "print('  FAIL  b  - detail of b')\n"
+        "print('1 passed, 1 failed')\n", encoding="utf-8")
+    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(srv))
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        code = REMOTE % {"raw": f"http://127.0.0.1:{httpd.server_address[1]}", "skills": ["s"], "dry": False}
+        env = dict(os.environ, HERMES_HOME=str(home), TEMP=str(tmp_path))
+        p = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, timeout=120)
+    finally:
+        httpd.shutdown()
+    rep = json.loads(p.stdout.strip().splitlines()[-1])
+    assert rep["tests"] == {"passed": 1, "failed": 1, "fail_lines": ["FAIL  b  - detail of b"]}
+
+
 def test_remote_script_end_to_end_reads_the_installers_stdout(tmp_path):
     # install.py logs to stdout; a remote script that read only stderr would lose every count.
     # Serve a fake installer over local HTTP and run REMOTE in a sandboxed Hermes home.
