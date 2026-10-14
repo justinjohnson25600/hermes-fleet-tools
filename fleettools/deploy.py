@@ -14,9 +14,14 @@ Deliberate behaviours, each earned from a real failure:
     The CDN lags a push by minutes and boxes silently install the OLD release.
   * Ships the payload as base64 to a temp file rather than inline `python -c`:
     long inline commands are truncated by cmd.exe.
-  * Cleans stale per-profile copies under <home>/profiles/*/skills/.
+  * Seeds every named profile's skills dir from the canonical install (a
+    profile never falls back to the default home), instead of deleting
+    per-profile copies as stale.
   * Compares each agent's check COUNT against the highest seen. A lower count
     means checks are silently skipping, which a green "0 failed" will hide.
+  * `--check-policy` admits roster identities as DATA: opaque, case-sensitive
+    non-blank strings, never coerced, and a roster with no enabled agent is
+    "nothing checked", not an all-clear.
 """
 from __future__ import annotations
 
@@ -38,6 +43,18 @@ RAW = os.environ.get(
     "FLEET_SKILLS_RAW",
     "https://raw.githubusercontent.com/YOUR-ORG/YOUR-SKILLS-REPO/main",
 )
+
+# Stage B consumer hook: the policy gate imports lazily so a roster deploy on
+# a box without the policy modules still works, and `--check-policy` — which
+# needs them — fails with a clear message instead of an import traceback.
+_sys_path_root = str(ROOT.parent)
+
+
+def _load_policy_module():
+    import importlib
+    if _sys_path_root not in sys.path:
+        sys.path.insert(0, _sys_path_root)
+    return importlib.import_module("fleettools.policy")
 
 REMOTE = r'''import json, os, pathlib, re, shutil, subprocess, sys, time, urllib.request
 RAW = "%(raw)s"
@@ -267,6 +284,44 @@ def load_agents() -> dict:
     )
 
 
+class PolicyGateInputError(Exception):
+    """The roster (or its shape) cannot be admitted by the policy gate."""
+
+
+def _load_roster() -> dict:
+    """load_agents + typed validation for the gate: a roster file that is
+    not JSON, not an object, or has no agent list is a refused INPUT, not a
+    traceback — the operator gets the file, the problem, and the fix."""
+    explicit = _ROSTER_OVERRIDE if _ROSTER_OVERRIDE is not None else os.environ.get('FLEET_ROSTER')
+    try:
+        raw = json.loads(Path(explicit).read_text(encoding='utf-8')) if explicit is not None else load_agents()
+    except SystemExit as exc:
+        raise PolicyGateInputError('no roster found') from exc
+    except json.JSONDecodeError as exc:
+        raise PolicyGateInputError(
+            f"roster is not valid JSON (line {exc.lineno})") from exc
+    except (OSError, UnicodeError) as exc:
+        raise PolicyGateInputError('roster is unreadable or not valid UTF-8') from exc
+    except (ValueError, RecursionError) as exc:
+        raise PolicyGateInputError(
+            f'roster JSON exceeds supported parser limits ({type(exc).__name__})') from exc
+    if not isinstance(raw, dict):
+        raise PolicyGateInputError(
+            f"roster must be a JSON object with an 'agents' list "
+            f"(got {type(raw).__name__})")
+    agents = raw.get("agents")
+    if not isinstance(agents, list):
+        raise PolicyGateInputError(
+            "roster is malformed: 'agents' must be a list of agent objects")
+    for i, a in enumerate(agents):
+        if not isinstance(a, dict):
+            raise PolicyGateInputError(
+                f"roster is malformed: agents[{i}] must be an object")
+        if not isinstance(a.get('enabled', False), bool):
+            raise PolicyGateInputError(f'roster is malformed: agents[{i}].enabled must be a boolean')
+    return raw
+
+
 def wait_for_cdn(skills: list[str], timeout: int = 420) -> dict:
     """Block until the CDN serves the versions this repo has. A push is not a
     release: raw.githubusercontent caches, and boxes install the previous one."""
@@ -389,6 +444,175 @@ def deliver(agent: dict, skills: list[str], dry: bool) -> tuple[str, dict]:
     return name, rep
 
 
+def check_policy_gate(args) -> int:
+    """--check-policy: report-only policy gate over the roster.
+
+    ALLOW verifies declared identity/role and capability presence only. No
+    delivery target is supplied here, so constrained skill_deploy paths are
+    not evaluated; ALLOW does not authorize a write to any particular path.
+
+    Joins each enabled agent's `identity` (the stable enrolled identity,
+    supplied as roster DATA) to a compiled client policy and refuses — per
+    agent, with the reason — when:
+
+    * the agent has no `identity` (hostname/COMPUTERNAME/BIOS serial are
+      never substituted: imaged machines share all three, so a fallback
+      would be a guess wearing a badge);
+    * the identity is not an opaque, case-sensitive non-blank string —
+      lists, dicts, numbers or padded/whitespaced values are typed DENYs,
+      never coerced or stripped into a match;
+    * no client policy placement exists for that identity;
+    * SEVERAL clients are placed on that identity's host and the roster
+      does not say which client the agent is — the claim is ambiguous and
+      is refused; no client is ever silently chosen for it;
+    * the roster role is missing, blank, or not a string — refused BEFORE
+      any capability is considered (a role that is not stated cannot
+      "match" anything);
+    * the client's role does not match the agent's rostered role;
+    * the `skill_deploy` capability is not granted to the client;
+    * two or more agents claim the same enrolled identity: EVERY roster
+      entry claiming it is refused, including the first — none of the
+      results would be an independent check, so the whole class fails
+      closed rather than anointing one lucky occurrence.
+
+    The policies are compiled fail-closed (expired/not-yet-valid exceptions
+    included). A compilation error refuses EVERY agent: the gate never
+    allows on a policy set it could not fully understand. A roster with no
+    enabled agent is reported as "nothing checked" and is NOT an all-clear.
+    Nothing is contacted and nothing is written — this is the Stage B
+    drift/report contract, wired into the existing deploy surface.
+    """
+    if not args.policy_dir:
+        print("--check-policy requires --policy-dir", file=sys.stderr)
+        return 2
+    try:
+        policy = _load_policy_module()
+    except ImportError as exc:
+        print(f"policy gate unavailable: {exc}", file=sys.stderr)
+        return 2
+    try:
+        roster = _load_roster()
+    except PolicyGateInputError as exc:
+        print(f"ROSTER REFUSED: {exc}", file=sys.stderr)
+        return 1
+    agents = [a for a in roster.get("agents", []) if a.get("enabled")]
+
+    try:
+        compiled = policy.compile_all(args.policy_dir)
+    except (policy.PolicySourceError, policy.PolicyCompileError) as exc:
+        print(f"COMPILATION FAILED — refusing every agent:\n{exc}",
+              file=sys.stderr)
+        return 1
+
+    # An identity maps to a HOST, and a host may legitimately carry several
+    # clients (each with its own vm_identity). A dict keyed by host_identity
+    # would let one of them silently win; keep the GROUP so the ambiguity is
+    # detectable and refusable instead of resolved by dict-insertion order.
+    by_identity: dict = {}
+    for eff in compiled.values():
+        by_identity.setdefault(eff.placement["host_identity"], []).append(eff)
+
+    def _bad_identity(agent: dict):
+        """An enrolled identity is an opaque, case-sensitive id: a typed hole
+        or a padded/whitespaced claim is refused, never coerced or matched."""
+        ident = agent.get("identity")
+        if ident is None:
+            return None, "no enrolled identity in the roster " \
+                         "(hostname/serial are never substituted)"
+        if not isinstance(ident, str):
+            return None, f"enrolled identity must be a string, got " \
+                         f"{type(ident).__name__} ({ident!r})"
+        if not ident.strip() or ident != ident.strip() or \
+                any(c.isspace() for c in ident):
+            return None, f"enrolled identity {ident!r} must be a non-blank " \
+                         f"string with no padding or whitespace"
+        return ident, None
+
+    allowed, refused = [], []
+    claims: dict = {}
+    for a in agents:
+        name = a.get("name", "?")
+        ident, why = _bad_identity(a)
+        if why:
+            refused.append((name, why))
+            continue
+        claims.setdefault(ident, []).append(name)
+    for ident, names in claims.items():
+        if len(names) > 1:
+            for name in names:
+                refused.append((name, f"identity {ident!r} is claimed by "
+                                f"{len(names)} roster entries "
+                                f"({', '.join(names)}); no result among "
+                                f"them is an independent check, so every "
+                                f"claimant is refused"))
+    for a in agents:
+        name = a.get("name", "?")
+        ident, bad = _bad_identity(a)
+        if bad or len(claims.get(ident, [])) > 1:
+            continue
+        effs = by_identity.get(ident)
+        if not effs:
+            refused.append((name, f"identity {ident!r} has no client policy "
+                            f"placement; placement is never guessed"))
+            continue
+        if len(effs) > 1:
+            clients = ", ".join(sorted(e.client for e in effs))
+            refused.append((name, f"identity {ident!r} is ambiguous: "
+                            f"{len(effs)} clients are placed on that host "
+                            f"({clients}) and the roster does not say "
+                            f"which client this agent is; none is chosen"))
+            continue
+        eff = effs[0]
+        roster_role = a.get("role")
+        if not isinstance(roster_role, str) or not roster_role.strip():
+            refused.append((name, f"roster role is missing, blank, or not "
+                            f"a string ({roster_role!r}); the role is "
+                            f"checked before any capability, and an "
+                            f"unstated role cannot match client policy "
+                            f"role {eff.role!r}"))
+            continue
+        if roster_role != eff.role:
+            refused.append((name, f"roster role {roster_role!r} != client "
+                            f"policy role {eff.role!r}"))
+            continue
+        grant = eff.capabilities.get("skill_deploy") or {}
+        if not grant.get("granted"):
+            refused.append((name, f"capability 'skill_deploy' not granted "
+                            f"to client '{eff.client}'"))
+            continue
+        allowed.append(name)
+
+    for name in allowed:
+        print(f"ALLOW {name}")
+    for name, why in refused:
+        print(f"DENY  {name}: {why}")
+    # Intended managed coverage is visible on EVERY path — including the
+    # nothing-checked one, so the reader always sees what the gate WOULD
+    # have certified and which hosts it does not manage at all.
+    intended = sorted({e.client for e in compiled.values()})
+    if intended:
+        print(f"managed coverage: {len(compiled)} client policy/policies "
+              f"compiled ({', '.join(intended)}) — agents are admitted "
+              f"against these; hosts without a client policy are not "
+              f"managed by this gate.")
+    if not agents:
+        # A roster whose every entry is disabled is NOT an all-clear: the
+        # gate must be able to certify a fleet it never examined.
+        roster_all = roster.get("agents", [])
+        disabled = len(roster_all) - len(agents)
+        msg = ("policy gate: NO ENABLED AGENTS — nothing was checked, so "
+               "nothing is certified.")
+        if disabled:
+            msg += f" ({disabled} disabled/unenrolled agent(s) in the roster)"
+        print(f"\n{msg} Report only; no deploy should treat this as a pass.")
+        return 1
+    enabled = len(agents)
+    print(f"\npolicy gate: {len(allowed)} allowed, {len(refused)} refused, "
+          f"{enabled} enabled agent(s) (report only — nothing was "
+          f"changed)")
+    return 1 if refused else 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Deliver skills to the Hermes agent fleet.")
     ap.add_argument("skills", nargs="*", help="skill names (default: every skill in skills.json)")
@@ -397,10 +621,19 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--no-wait", action="store_true", help="skip the CDN freshness wait")
     ap.add_argument("--roster", help="path to agents.json (default: ./agents.json, ./roster/agents.json, or beside this script)")
+    ap.add_argument("--check-policy", action="store_true",
+                    help="report-only policy gate: verify every enabled agent's "
+                         "enrolled identity has a matching, capable client policy "
+                         "(requires --policy-dir; contacts nothing, writes nothing; "
+                         "a roster with no enabled agent is 'nothing checked', exit 1)")
+    ap.add_argument("--policy-dir", help="policy directory for --check-policy")
     args = ap.parse_args()
 
     global _ROSTER_OVERRIDE
     _ROSTER_OVERRIDE = args.roster
+
+    if args.check_policy:
+        return check_policy_gate(args)
 
     cfg = load_agents()
     agents = cfg["agents"]

@@ -19,7 +19,9 @@ Every one of those reported green. The tooling here exists to make them report r
 
 | File | Purpose |
 |---|---|
-| `fleettools/deploy.py` | Deliver skills to every enabled agent in parallel; verify versions and test counts |
+| `fleettools/deploy.py` | Deliver skills to every enabled agent in parallel; verify versions and test counts; `--check-policy` gates the roster against compiled client policies (report-only) |
+| `fleettools/policy.py` | Stage B: compile common→role→client layers into one canonical effective policy per client; snapshot + report-only drift (`README-business-policy.md`) |
+| `fleettools/journal.py` | Stage E: tenant-scoped append-only evidence journal, readiness gate, human-only promotion sequence (`README-evidence-journal.md`) |
 | `fleettools/agents.example.json` | Roster format — copy to `agents.json` and fill in |
 | `check_no_estate_data.py` | Pre-commit guard: refuses to publish usernames, IPs, serials, machine names |
 
