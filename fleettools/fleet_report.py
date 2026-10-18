@@ -92,6 +92,10 @@ if (Test-Path $repo) {
   Write-Output ('ORIGINHEAD=' + (& $git rev-parse origin/main 2>&1))
   Write-Output ('BEHINDORIGIN=' + (& $git rev-list --count 'HEAD..origin/main' 2>&1))
   Write-Output ('AHEADORIGIN='  + (& $git rev-list --count 'origin/main..HEAD' 2>&1))
+  # Local work = commits in neither origin/main nor any published release tag. A stable release
+  # is cut before main records it (v0.22.2: two days), so AHEADORIGIN alone reads release commits
+  # as local ones and every stable node shows DIVERGED.
+  Write-Output ('LOCALONLY='    + (& $git rev-list --count HEAD --not origin/main '--tags=v[0-9]*' 2>&1))
   Pop-Location
 } else { Write-Output 'REPO_MISSING=1' }
 Write-Output '===DESKTOP==='
@@ -120,6 +124,7 @@ if [ -d "$repo" ]; then
   echo "ORIGINHEAD=$(git rev-parse origin/main 2>&1)"
   echo "BEHINDORIGIN=$(git rev-list --count HEAD..origin/main 2>&1)"
   echo "AHEADORIGIN=$(git rev-list --count origin/main..HEAD 2>&1)"
+  echo "LOCALONLY=$(git rev-list --count HEAD --not origin/main '--tags=v[0-9]*' 2>&1)"
 else
   echo 'REPO_MISSING=1'
 fi
@@ -255,8 +260,15 @@ def classify(rec: dict) -> tuple[str, list[str]]:
         a_org, b_org = _int(git.get("AHEADORIGIN")), _int(git.get("BEHINDORIGIN"))
         if a_org is None:
             return UNKNOWN, ["release channel, but origin/main..HEAD was unreadable"]
-        if a_org:
-            return DIVERGED, [f"{a_org} local commit(s) not in origin/main"]
+        # Release commits are not local work; an older collector without LOCALONLY keeps the
+        # origin/main arithmetic.
+        local = _int(git.get("LOCALONLY"))
+        if local is None and "LOCALONLY" in git:
+            return UNKNOWN, ["release channel, but local-commit count was unreadable"]
+        n = a_org if local is None else local
+        if n:
+            where = "origin/main" if local is None else "origin/main or any release tag"
+            return DIVERGED, [f"{n} local commit(s) not in {where}"]
         stashes, dirty = _int(git.get("STASHES")), _int(git.get("DIRTY"))
         if stashes:
             reasons.append(f"{stashes} stash(es)")

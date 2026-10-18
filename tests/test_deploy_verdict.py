@@ -20,7 +20,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from fleettools.deploy import REMOTE, format_versions, skill_failures, verify_counts  # noqa: E402
+from fleettools.deploy import format_versions, render_remote, skill_failures, verify_counts  # noqa: E402
 
 
 def report(**skills) -> dict:
@@ -76,7 +76,7 @@ def test_verify_counts_reads_the_installer_summary_line():
 
 def test_the_remote_script_records_the_verify_counts():
     # REMOTE runs on each box; it must carry the parser and store its result per skill.
-    code = REMOTE % {"raw": "https://example.invalid", "skills": ["s"], "dry": False}
+    code = render_remote(["s"], False, raw="https://example.invalid")
     compile(code, "<remote>", "exec")
     assert '["verify"]' in code
 
@@ -175,7 +175,7 @@ def test_remote_script_captures_the_failing_devpair_check_names(tmp_path):
     httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     try:
-        code = REMOTE % {"raw": f"http://127.0.0.1:{httpd.server_address[1]}", "skills": ["s"], "dry": False}
+        code = render_remote(["s"], False, raw=f"http://127.0.0.1:{httpd.server_address[1]}")
         env = dict(os.environ, HERMES_HOME=str(home), TEMP=str(tmp_path))
         p = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, timeout=120)
     finally:
@@ -201,7 +201,7 @@ def test_remote_script_end_to_end_reads_the_installers_stdout(tmp_path):
     httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     try:
-        code = REMOTE % {"raw": f"http://127.0.0.1:{httpd.server_address[1]}", "skills": ["s"], "dry": False}
+        code = render_remote(["s"], False, raw=f"http://127.0.0.1:{httpd.server_address[1]}")
         env = dict(os.environ, HERMES_HOME=str(home), TEMP=str(tmp_path))
         p = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, timeout=120)
     finally:

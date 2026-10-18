@@ -14,7 +14,14 @@ Deliberate behaviours, each earned from a real failure:
     The CDN lags a push by minutes and boxes silently install the OLD release.
   * Ships the payload as base64 to a temp file rather than inline `python -c`:
     long inline commands are truncated by cmd.exe.
-  * Cleans stale per-profile copies under <home>/profiles/*/skills/.
+  * Cleans stale copies outside the canonical dir and profiles/.
+  * Keeps what agents honed: a canonical or per-profile copy holding content the
+    skills repo never published is HELD and reported, never overwritten (owner
+    decision 2026-10-18). Copies of any published version are replaced. Without
+    the repo's history every differing copy is held (fail closed).
+    --replace-honed overrides, owner-approved only.
+  * Seeds only real profiles: tombstoned, identity-less and opted-out dirs are
+    skipped.
   * Compares each agent's check COUNT against the highest seen. A lower count
     means checks are silently skipping, which a green "0 failed" will hide.
 """
@@ -39,10 +46,116 @@ RAW = os.environ.get(
     "https://raw.githubusercontent.com/YOUR-ORG/YOUR-SKILLS-REPO/main",
 )
 
+HONING_SRC = r'''
+import hashlib as _hl, pathlib as _pl, shutil as _sh
+
+# Same identity rule as Hermes (hermes_constants.named_profile_has_identity): a dir under
+# profiles/ without one of these, or with a tombstone in profiles/.deleted/, is not a profile.
+# Seeding such a dir kept a deleted profile alive on disk (2026-10).
+_IDENTITY = ("config.yaml", ".env", "SOUL.md", "profile.yaml", "auth.json", "state.db")
+
+
+def content_hash(data):
+    """Line-ending-blind digest: install.py writes text, so Windows copies carry CRLF."""
+    return _hl.sha256(data.replace(b"\r\n", b"\n")).hexdigest()[:16]
+
+
+def managed_files(d):
+    """Every file of an installed skill copy, minus dot-entries and bytecode."""
+    d = _pl.Path(d)
+    out = []
+    for f in sorted(d.rglob("*")) if d.is_dir() else []:
+        rel = f.relative_to(d).parts
+        if f.is_file() and not any(p.startswith(".") or p == "__pycache__" for p in rel):
+            out.append(f)
+    return out
+
+
+def local_edits(files, known):
+    """Files whose content was never published: the agent (or a person) honed this copy.
+
+    `known` holds the digest of every blob the skills repo ever published for the skill, so a
+    copy of ANY published version is untouched and safe to replace; anything else is local work.
+    An empty `known` (repo unavailable) holds every copy that differs: fail closed.
+    """
+    return [str(f) for f in files if content_hash(f.read_bytes()) not in known]
+
+
+def is_profile(prof):
+    prof = _pl.Path(prof)
+    return (prof.is_dir() and not prof.name.startswith(".")
+            and not (prof.parent / ".deleted" / prof.name).exists()
+            and any((prof / m).is_file() or (prof / m).is_symlink() for m in _IDENTITY))
+
+
+def seed_profiles(home, skill, known, replace=False):
+    """Seed each profile's copy of `skill` from the canonical install, holding honed copies."""
+    home = _pl.Path(home)
+    res = {"seeded": [], "replaced": [], "held": [], "errors": []}
+    canon = sorted(home.glob("skills/*/%s/SKILL.md" % skill))
+    prof_root = home / "profiles"
+    if not canon or not prof_root.is_dir():
+        return res
+    canon = canon[0].parent
+    body = (canon / "SKILL.md").read_bytes()
+    rel = canon.relative_to(home / "skills")
+    for prof in sorted(prof_root.iterdir()):
+        if not is_profile(prof) or (prof / ".no-bundled-skills").exists():
+            continue
+        dst = prof / "skills" / rel
+        cur = dst / "SKILL.md"
+        try:
+            if cur.is_file() and cur.read_bytes() == body:
+                continue
+            if cur.is_file():
+                edits = local_edits(managed_files(dst), known)
+                if edits and not replace:
+                    res["held"].append({"where": str(dst), "files": edits[:10], "count": len(edits)})
+                    continue
+                _sh.rmtree(dst, ignore_errors=True)
+                res["replaced"].append(str(cur))
+            dst.mkdir(parents=True, exist_ok=True)
+            for f in canon.iterdir():
+                if f.is_file():
+                    _sh.copy2(f, dst / f.name)
+            for sub in canon.iterdir():
+                if sub.is_dir() and not sub.name.startswith("."):
+                    _sh.copytree(sub, dst / sub.name, dirs_exist_ok=True)
+            res["seeded"].append(str(dst))
+        except OSError as e:
+            res["errors"].append("%s: %s" % (prof.name, e))
+    return res
+
+
+def canonical_edits(home, skill, known, state):
+    """Local edits in the default home's install of `skill`: its skill dir plus declared state files."""
+    home = _pl.Path(home)
+    canon = sorted(home.glob("skills/*/%s/SKILL.md" % skill))
+    if not canon:
+        return []
+    files = managed_files(canon[0].parent)
+    state_dir, state_files = state or (None, [])
+    if state_dir:
+        files += [home / state_dir / f for f in state_files if (home / state_dir / f).is_file()]
+    return local_edits(files, known)
+'''
+_honing: dict = {}
+exec(HONING_SRC, _honing)  # the same functions the payload carries, importable for tests
+content_hash = _honing["content_hash"]
+managed_files = _honing["managed_files"]
+local_edits = _honing["local_edits"]
+is_profile = _honing["is_profile"]
+seed_profiles = _honing["seed_profiles"]
+canonical_edits = _honing["canonical_edits"]
+
 REMOTE = r'''import json, os, pathlib, re, shutil, subprocess, sys, time, urllib.request
 RAW = "%(raw)s"
 SKILLS = %(skills)r
 DRY = %(dry)s
+KNOWN = {k: set(v) for k, v in %(known)r.items()}
+STATE = %(state)r
+REPLACE = %(replace)s
+%(honing)s
 h = os.environ.get("HERMES_HOME") or os.path.join(os.environ.get("LOCALAPPDATA", ""), "hermes")
 HOME = pathlib.Path(h) if h and pathlib.Path(h).is_dir() else pathlib.Path.home() / ".hermes"
 rep = {"host": os.environ.get("COMPUTERNAME") or os.uname().nodename, "home": str(HOME), "skills": {}}
@@ -102,9 +215,22 @@ def ver(f):
     except Exception:
         return None
 
+# A default-home install that carries local edits is held: install.py would overwrite it.
+HELD = {}
+if not DRY and not REPLACE:
+    for s in SKILLS:
+        _e = canonical_edits(HOME, s, KNOWN.get(s, set()), STATE.get(s))
+        if _e:
+            HELD[s] = _e
+rep["held"] = [{"skill": s, "where": "canonical", "files": e[:10], "count": len(e)}
+               for s, e in sorted(HELD.items())]
+
 for s in SKILLS:
     if DRY:
         rep["skills"][s] = {"dry_run": True}
+        continue
+    if s in HELD:
+        rep["skills"][s] = {"held": True}
         continue
     p = subprocess.run([sys.executable, str(tmp), s], capture_output=True, text=True, timeout=900)
     # install.py logs to stdout, including "VERIFY FAILED" and the suite's "N passed, M failed".
@@ -122,6 +248,8 @@ for s in SKILLS:
 cleaned = []
 if not DRY:
     for s in SKILLS:
+        if s in HELD:
+            continue
         canon = list(HOME.glob("skills/*/%%s/SKILL.md" %% s))
         canon = canon[0] if canon else None
         stray = HOME / s / "SKILL.md"
@@ -134,42 +262,21 @@ if not DRY:
 rep["cleaned"] = cleaned
 
 # per-profile visibility: seed every profile's skills dir from the canonical
-# install (same content), skipping deliberate opt-outs. A copy that already
-# matches is left alone; one that differs (old version or the pre-split layout
-# with code files inside) is replaced. Profile-local state (devpair/config.json)
-# is never touched — only the prompt files are managed.
+# install (same content), skipping deliberate opt-outs and non-profiles. A copy
+# that already matches is left alone; one holding only published content (an
+# old version, the pre-split layout) is replaced; one with local edits is HELD
+# and reported: agents hone their own skills, and a deploy never erases that.
+# A held canonical install is not propagated. Profile-local state
+# (devpair/config.json) is never touched — only the prompt files are managed.
 seeded, pruned_profiles = [], []
 if not DRY:
-    prof_root = HOME / "profiles"
     for s in SKILLS:
-        canon = list(HOME.glob("skills/*/%%s/SKILL.md" %% s))
-        canon = canon[0] if canon else None
-        if canon is None:
+        if s in HELD:
             continue
-        body = canon.read_bytes()
-        rel = canon.parent.relative_to(HOME / "skills")
-        for prof in sorted(prof_root.iterdir()) if prof_root.is_dir() else []:
-            if not prof.is_dir() or prof.name.startswith("."):
-                continue
-            if (prof / ".no-bundled-skills").exists():
-                continue
-            dst = prof / "skills" / rel
-            cur = dst / "SKILL.md"
-            try:
-                if cur.is_file() and cur.read_bytes() == body:
-                    continue
-                if cur.is_file():
-                    shutil.rmtree(dst, ignore_errors=True); pruned_profiles.append(str(cur))
-                dst.mkdir(parents=True, exist_ok=True)
-                for f in canon.parent.iterdir():
-                    if f.is_file():
-                        shutil.copy2(f, dst / f.name)
-                for sub in canon.parent.iterdir():
-                    if sub.is_dir() and not sub.name.startswith("."):
-                        shutil.copytree(sub, dst / sub.name, dirs_exist_ok=True)
-                seeded.append(str(dst))
-            except OSError as e:
-                pruned_profiles.append("ERR %%s: %%s" %% (prof.name, e))
+        _r = seed_profiles(HOME, s, KNOWN.get(s, set()), REPLACE)
+        seeded += _r["seeded"]
+        pruned_profiles += _r["replaced"] + ["ERR " + e for e in _r["errors"]]
+        rep["held"] += [dict(h, skill=s) for h in _r["held"]]
 rep["seeded_profiles"] = seeded
 rep["pruned_profiles"] = pruned_profiles
 
@@ -238,6 +345,8 @@ def format_versions(r: dict) -> str:
     parts = []
     for s, d in (r.get("skills") or {}).items():
         p = f"{s}={d.get('version')}{_checks(d.get('verify'))}"
+        if d.get("held"):
+            p += " (held: local edits)"
         if d.get("other_versions"):
             p += f" (other copies: {','.join(d['other_versions'])})"
         parts.append(p)
@@ -353,9 +462,72 @@ def resolve_python(host: str, pinned: str | None) -> tuple[str | None, str]:
     return found, ""
 
 
+_HOLD: dict = {"known": {}, "state": {}, "replace": False}
+
+
+def _git(repo: Path, *args: str, data: bytes | None = None) -> bytes:
+    return subprocess.run(["git", "-C", str(repo), *args], input=data, capture_output=True,
+                          check=True).stdout
+
+
+def _published_ref(repo: Path) -> str:
+    probe = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "-q", "origin/main"],
+                           capture_output=True)
+    return "origin/main" if probe.returncode == 0 else "HEAD"
+
+
+def published_hashes(repo: Path, skills: list[str]) -> dict[str, list[str]]:
+    """content_hash of every blob the skills repo ever published under each skill's directory.
+
+    A live copy made only of these is some published version, so replacing it loses nothing;
+    any other content is local honing and is held.
+    """
+    ref = _published_ref(repo)
+    out = {}
+    for s in skills:
+        log = _git(repo, "log", ref, "-m", "--format=", "--raw", "--no-abbrev", "--no-renames",
+                   "--", f"{s}/").decode("utf-8", "replace")
+        shas = {sha for line in log.splitlines() if line.startswith(":")
+                for sha in line.split()[2:4] if set(sha) != {"0"}}
+        blobs = []
+        if shas:
+            data = _git(repo, "cat-file", "--batch", data=("\n".join(sorted(shas)) + "\n").encode())
+            i = 0
+            while i < len(data):
+                nl = data.index(b"\n", i)
+                head = data[i:nl].split()
+                if head[-1] == b"missing":
+                    i = nl + 1
+                    continue
+                size = int(head[2])
+                blobs.append(data[nl + 1:nl + 1 + size])
+                i = nl + 1 + size + 1
+        out[s] = sorted({content_hash(b) for b in blobs})
+    return out
+
+
+def state_files(repo: Path, skills: list[str]) -> dict[str, tuple[str, list[str]]]:
+    """Each skill's install.py state dir and declared files (installed outside the skill dir)."""
+    ref, out = _published_ref(repo), {}
+    for s in skills:
+        try:
+            m = json.loads(_git(repo, "show", f"{ref}:{s}/skill.json"))
+        except (subprocess.CalledProcessError, ValueError):
+            continue
+        if m.get("files"):
+            out[s] = (m.get("state_dir", s), list(m["files"]))
+    return out
+
+
+def render_remote(skills: list[str], dry: bool, raw: str | None = None, known: dict | None = None,
+                  state: dict | None = None, replace: bool = False) -> str:
+    return REMOTE % {"raw": raw or RAW, "skills": skills, "dry": dry, "known": known or {},
+                     "state": state or {}, "replace": replace, "honing": HONING_SRC}
+
+
 def deliver(agent: dict, skills: list[str], dry: bool) -> tuple[str, dict]:
     name, host = agent["name"], agent["host"]
-    code = REMOTE % {"raw": RAW, "skills": skills, "dry": dry}
+    code = render_remote(skills, dry, **_HOLD)
     # Not every Windows box has a usable `python` on PATH. Some have only the
     # Microsoft Store alias stub, which prints an install advert and exits 9009
     # instead of running anything. An agent may therefore pin its interpreter,
@@ -397,6 +569,11 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--no-wait", action="store_true", help="skip the CDN freshness wait")
     ap.add_argument("--roster", help="path to agents.json (default: ./agents.json, ./roster/agents.json, or beside this script)")
+    ap.add_argument("--skills-repo", default=os.environ.get("FLEET_SKILLS_REPO",
+                                                            str(Path.home() / "repos" / "hermes_skills")),
+                    help="local clone of the skills repo; its history tells published content from local honing")
+    ap.add_argument("--replace-honed", action="store_true",
+                    help="overwrite copies with local edits (owner-approved only; default holds and reports them)")
     args = ap.parse_args()
 
     global _ROSTER_OVERRIDE
@@ -417,9 +594,12 @@ def main() -> int:
 
     skills = args.skills
     if args.all or not skills:
-        manifest = ROOT / "skills.json"
+        # The skills repo owns the list; a copy beside this script is the fallback.
+        manifest = Path(args.skills_repo).expanduser() / "skills.json"
         if not manifest.is_file():
-            print("--all needs a skills.json listing skill names, or name skills explicitly.")
+            manifest = ROOT / "skills.json"
+        if not manifest.is_file():
+            print("--all needs a skills.json (in --skills-repo or beside this script), or name skills explicitly.")
             return 1
         skills = json.loads(manifest.read_text(encoding="utf-8"))
     # Skills are fetched from the remote source at install time, so there is
@@ -432,6 +612,19 @@ def main() -> int:
           f"{' [DRY RUN]' if args.dry_run else ''}")
     for a in skipped:
         print(f"  SKIP {a['name']}: {a.get('blocked_reason', 'disabled')[:110]}")
+
+    repo = Path(args.skills_repo).expanduser()
+    _HOLD["replace"] = args.replace_honed
+    if (repo / ".git").exists():
+        subprocess.run(["git", "-C", str(repo), "fetch", "-q", "origin"], capture_output=True, timeout=120)
+        _HOLD["known"] = published_hashes(repo, skills)
+        _HOLD["state"] = state_files(repo, skills)
+        n = sum(len(v) for v in _HOLD["known"].values())
+        print(f"  honing guard: {n} published blob digest(s) from {repo} ({_published_ref(repo)})")
+    else:
+        print(f"  HOLD-ALL: no skills repo at {repo}; every copy that differs will be held (fail closed)")
+    if args.replace_honed:
+        print("  --replace-honed: local edits WILL be overwritten")
 
     if not args.dry_run and not args.no_wait:
         cdn = wait_for_cdn(skills)
@@ -446,6 +639,7 @@ def main() -> int:
 
     print()
     counts, failed = [], []
+    held_total = 0
     seen_hosts: dict[str, str] = {}
     # Check counts are only comparable between nodes of the same OS.
     agent_by_name = {a["name"]: a for a in targets}
@@ -454,6 +648,9 @@ def main() -> int:
             print(f"  FAIL {name}: {r['error'][:160]}")
             failed.append(name)
             continue
+        for h in r.get("held") or []:
+            held_total += 1
+            print(f"  HELD {name:<18} {h['skill']} at {h['where']}: {h['count']} locally honed file(s) kept")
         # Identity is the BIOS serial, not the hostname: these boxes are imaged
         # clones that legitimately share a COMPUTERNAME (and MachineGuid), so
         # keying on the name would warn forever on a correct roster and train
@@ -530,6 +727,9 @@ def main() -> int:
             print(f"  note: check counts differ by platform ({spread}) — expected when "
                   f"assertions are platform-guarded; confirm the delta is explained.")
 
+    if held_total:
+        print(f"\n{held_total} honed copy(ies) kept, not overwritten. Promote improvements to the skills "
+              f"repo, or re-run with --replace-honed once the owner approves.")
     if failed:
         print(f"\n{len(set(failed))} agent(s) need attention: {', '.join(sorted(set(failed)))}")
         return 1
