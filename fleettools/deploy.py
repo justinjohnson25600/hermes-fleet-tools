@@ -194,6 +194,26 @@ stale_copies = _honing["stale_copies"]
 seed_profiles = _honing["seed_profiles"]
 canonical_edits = _honing["canonical_edits"]
 
+PIN_SRC = r'''
+def pin_installer(text, raw):
+    """Point install.py's RAW_BASE at `raw`.
+
+    install.py downloads every skill file from its own RAW_BASE constant (the repo's main),
+    whatever ref it was itself fetched from, so without this a candidate ref installs main's
+    files and reports success at the old version. Refuse unless the constant appears exactly
+    once: installing main while claiming a candidate is the failure this exists to stop.
+    """
+    import re as _re
+    pat = _re.compile(r'^RAW_BASE = "[^"\n]*"$', _re.M)
+    n = len(pat.findall(text))
+    if n != 1:
+        raise ValueError("installer RAW_BASE found %d times, need exactly 1" % n)
+    return pat.sub(lambda m: 'RAW_BASE = "' + raw.rstrip("/") + '"', text)
+'''
+_pin: dict = {}
+exec(PIN_SRC, _pin)  # the function the payload carries, importable for tests
+pin_installer = _pin["pin_installer"]
+
 REMOTE = r'''import json, os, pathlib, re, shutil, subprocess, sys, time, urllib.request
 RAW = "%(raw)s"
 SKILLS = %(skills)r
@@ -202,6 +222,7 @@ KNOWN = {k: set(v) for k, v in %(known)r.items()}
 STATE = %(state)r
 REPLACE = %(replace)s
 %(honing)s
+%(pin)s
 h = os.environ.get("HERMES_HOME") or os.path.join(os.environ.get("LOCALAPPDATA", ""), "hermes")
 HOME = pathlib.Path(h) if h and pathlib.Path(h).is_dir() else pathlib.Path.home() / ".hermes"
 rep = {"host": os.environ.get("COMPUTERNAME") or os.uname().nodename, "home": str(HOME), "skills": {}}
@@ -230,9 +251,14 @@ if not HOME.is_dir():
 tmp = pathlib.Path(os.environ.get("TEMP") or "/tmp") / ("inst%%d.py" %% time.time())
 try:
     with urllib.request.urlopen(RAW + "/install.py?cb=" + str(time.time()), timeout=90) as r:
-        tmp.write_bytes(r.read())
+        _inst = r.read().decode("utf-8")
 except Exception as e:
     rep["error"] = "installer fetch failed: %%s" %% e
+    print(json.dumps(rep)); raise SystemExit(0)
+try:
+    tmp.write_text(pin_installer(_inst, RAW), encoding="utf-8")
+except ValueError as e:
+    rep["error"] = "refusing to install from %%s: %%s" %% (RAW, e)
     print(json.dumps(rep)); raise SystemExit(0)
 
 def _walk(root, pattern):
@@ -378,6 +404,21 @@ def skill_failures(r: dict) -> list[str]:
             out.append(msg)
         elif v and v["failed"]:
             out.append(f"{s}: {v['failed']} check(s) failed{_checks(v)}")
+    return out
+
+
+def version_failures(r: dict, expected: dict | None) -> list[str]:
+    """One message per delivered skill whose installed version is not the version served at RAW.
+
+    An installer that exits 0 at the old version is not a release: it is the silent success a
+    candidate canary produced when install.py fetched main instead of the candidate."""
+    out = []
+    for s, d in (r.get("skills") or {}).items():
+        want = (expected or {}).get(s)
+        if not want or d.get("held") or d.get("dry_run"):
+            continue
+        if d.get("version") != want:
+            out.append(f"{s}: installed {d.get('version')}, expected {want} from {RAW}")
     return out
 
 
@@ -569,7 +610,8 @@ def state_files(repo: Path, skills: list[str]) -> dict[str, tuple[str, list[str]
 def render_remote(skills: list[str], dry: bool, raw: str | None = None, known: dict | None = None,
                   state: dict | None = None, replace: bool = False) -> str:
     return REMOTE % {"raw": raw or RAW, "skills": skills, "dry": dry, "known": known or {},
-                     "state": state or {}, "replace": replace, "honing": HONING_SRC}
+                     "state": state or {}, "replace": replace, "honing": HONING_SRC,
+                     "pin": PIN_SRC}
 
 
 def deliver(agent: dict, skills: list[str], dry: bool) -> tuple[str, dict]:
@@ -673,8 +715,11 @@ def main() -> int:
     if args.replace_honed:
         print("  --replace-honed: local edits WILL be overwritten")
 
+    expected: dict | None = None
     if not args.dry_run and not args.no_wait:
         cdn = wait_for_cdn(skills)
+        if cdn and cdn.get("current"):
+            expected = {s: v for s, v in (cdn.get("want") or {}).items() if isinstance(v, str)}
         if cdn and not cdn["current"]:
             print(f"  WARNING: CDN still stale after wait: {cdn['serving']} (want {cdn['want']})")
             print("  Boxes may install the previous release. Re-run later, or pass --no-wait to force.")
@@ -712,7 +757,7 @@ def main() -> int:
             failed.append(name)
         if ident:
             seen_hosts[ident] = name
-        bad = skill_failures(r)
+        bad = skill_failures(r) + version_failures(r, expected)
         if bad:
             # The files may have landed, but the skill is not proven working there.
             for msg in bad:

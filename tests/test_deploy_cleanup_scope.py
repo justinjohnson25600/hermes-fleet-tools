@@ -49,7 +49,7 @@ def _serve(directory: Path):
 def run_payload(tmp_path: Path, home: Path) -> dict:
     """The real payload a node runs, with an installer that changes nothing."""
     srv = tmp_path / "srv"
-    put(srv / "install.py", b"import sys\nsys.exit(0)\n")
+    put(srv / "install.py", b'RAW_BASE = "https://raw.example/main"\nimport sys\nsys.exit(0)\n')
     httpd = _serve(srv)
     try:
         code = render_remote(["s"], False, raw=f"http://127.0.0.1:{httpd.server_address[1]}", known=KNOWN)

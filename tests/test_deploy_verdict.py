@@ -164,7 +164,8 @@ def test_the_failed_devpair_check_is_named_in_the_verdict(monkeypatch, capsys):
 def test_remote_script_captures_the_failing_devpair_check_names(tmp_path):
     srv = tmp_path / "srv"
     srv.mkdir()
-    (srv / "install.py").write_text("print('[install] verify passed.')\n", encoding="utf-8")
+    (srv / "install.py").write_text('RAW_BASE = "https://raw.example/main"\n'
+                                    "print('[install] verify passed.')\n", encoding="utf-8")
     home = tmp_path / "home"
     (home / "devpair").mkdir(parents=True)
     (home / "devpair" / "test_devpair.py").write_text(
@@ -190,6 +191,7 @@ def test_remote_script_end_to_end_reads_the_installers_stdout(tmp_path):
     srv = tmp_path / "srv"
     srv.mkdir()
     (srv / "install.py").write_text(
+        'RAW_BASE = "https://raw.example/main"\n'
         "import sys\n"
         "print('[install] verifying: test_x.py')\n"
         "print('[install]   7 passed, 1 failed')\n"

@@ -150,6 +150,7 @@ def test_end_to_end_a_honed_canonical_install_is_not_reinstalled_or_propagated(t
     """The real payload against a fake installer that would overwrite the canonical copy."""
     srv = tmp_path / "srv"
     put(srv / "install.py",
+        b'RAW_BASE = "https://raw.example/main"\n'
         b"import os, pathlib, sys\n"
         b"h = pathlib.Path(os.environ['HERMES_HOME'])\n"
         b"(h / 'skills/dev/s/SKILL.md').write_bytes(" + repr(V2).encode() + b")\n"
