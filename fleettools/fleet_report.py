@@ -49,7 +49,23 @@ from typing import Any, Optional
 
 # --------------------------------------------------------------------------
 # Remote payloads. Shipped base64/-EncodedCommand so no quoting survives three
-# layers of shell, and so a long command line is never truncated by cmd.exe.
+# layers of shell. The encoding costs ~2.7 characters per payload character and
+# cmd.exe refuses a line over 8191 (powershell_command), so the explanations
+# live here, not in the payload:
+#  - $repo: the roster stores repo paths in cmd.exe form (%LOCALAPPDATA%), which
+#    PowerShell does not expand -- it would test a literal path that never exists
+#    and report every agent as BLOCKED.
+#  - $git: pm-era installs keep git under tools\<entry>\cmd and NOT on PATH
+#    (ascend-ai, 2026-10-11: bare 'git' failed, so HEAD was unreadable and the
+#    nightly reported UNKNOWN). Resolve it the way the FleetOps worker does: the
+#    install's own tools\facts.json first, then PATH.
+#  - ORIGINHEAD/BEHINDORIGIN/AHEADORIGIN: a branch with no upstream cannot answer
+#    @{u}. Fall back to the default remote branch so a deliberately-patched
+#    checkout still reports real drift instead of collapsing to UNKNOWN.
+#  - LOCALONLY: local work = commits in neither origin/main nor any published
+#    release tag. A stable release is cut before main records it (v0.22.2: two
+#    days), so AHEADORIGIN alone reads release commits as local ones and every
+#    stable node shows DIVERGED.
 # --------------------------------------------------------------------------
 
 PS_PROBE = r"""$ErrorActionPreference='SilentlyContinue'
@@ -60,14 +76,8 @@ Write-Output '===CLI==='; Write-Output $cli
 Write-Output '===VER==='; if ($cli) { & $cli --version 2>&1 | Select-Object -First 1 }
 Write-Output '===CHECK==='; if ($cli) { & $cli update --check 2>&1 | Select-Object -First 10 }
 Write-Output '===GIT==='
-# The roster stores repo paths in cmd.exe form (%LOCALAPPDATA%), which
-# PowerShell does not expand -- it would test a literal path that never exists
-# and report every agent as BLOCKED. Expand to the PowerShell equivalent here.
 $repo = '@@REPO@@'
 $repo = [System.Environment]::ExpandEnvironmentVariables($repo)
-# pm-era installs keep git under tools\<entry>\cmd and NOT on PATH (ascend-ai, 2026-10-11: bare
-# 'git' failed, so HEAD was unreadable and the nightly reported UNKNOWN). Resolve it the way the
-# FleetOps worker does: the install's own tools\facts.json first, then PATH.
 $git = 'git'
 $facts = Join-Path (Split-Path $repo -Parent) 'tools\facts.json'
 if (Test-Path -LiteralPath $facts) {
@@ -86,15 +96,9 @@ if (Test-Path $repo) {
   Write-Output ('MERGEBASE='  + (& $git merge-base HEAD '@{u}' 2>&1))
   Write-Output ('STASHES='    + ((& $git stash list 2>&1 | Measure-Object -Line).Lines))
   Write-Output ('DIRTY='      + ((& $git status --porcelain 2>&1 | Measure-Object -Line).Lines))
-  # A branch with no upstream cannot answer @{u}. Fall back to the default
-  # remote branch so a deliberately-patched checkout still reports real drift
-  # instead of collapsing to UNKNOWN.
   Write-Output ('ORIGINHEAD=' + (& $git rev-parse origin/main 2>&1))
   Write-Output ('BEHINDORIGIN=' + (& $git rev-list --count 'HEAD..origin/main' 2>&1))
   Write-Output ('AHEADORIGIN='  + (& $git rev-list --count 'origin/main..HEAD' 2>&1))
-  # Local work = commits in neither origin/main nor any published release tag. A stable release
-  # is cut before main records it (v0.22.2: two days), so AHEADORIGIN alone reads release commits
-  # as local ones and every stable node shows DIVERGED.
   Write-Output ('LOCALONLY='    + (& $git rev-list --count HEAD --not origin/main '--tags=v[0-9]*' 2>&1))
   Pop-Location
 } else { Write-Output 'REPO_MISSING=1' }
@@ -319,6 +323,26 @@ def classify(rec: dict) -> tuple[str, list[str]]:
     return UNKNOWN, reasons + ["HEAD does not match upstream despite ahead=0, behind=0"]
 
 
+# Windows OpenSSH runs a remote command through cmd.exe, which refuses a line over 8191
+# characters ("The command line is too long."). Three comment blocks added inside PS_PROBE on
+# 2026-10-18 took its line to 8,546 and every Windows node read UNREACHABLE for two nights.
+CMD_EXE_MAX_COMMAND = 8191
+
+
+def powershell_command(script: str, flags: str = "-NoProfile") -> str:
+    """The `powershell -EncodedCommand` line that runs `script` on a remote Windows box.
+
+    Raises ValueError when the line is longer than cmd.exe accepts, so an oversize payload fails
+    as itself instead of being sent and coming back as an unreachable node.
+    """
+    enc = base64.b64encode(script.encode("utf-16-le")).decode()
+    line = f"powershell {flags} -EncodedCommand {enc}"
+    if len(line) > CMD_EXE_MAX_COMMAND:
+        raise ValueError(f"PowerShell payload is {len(line)} characters on the command line; "
+                         f"cmd.exe accepts {CMD_EXE_MAX_COMMAND} (keep comments out of payloads)")
+    return line
+
+
 def probe(agent: dict, timeout: int) -> dict:
     name = agent.get("name", "?")
     rec: dict = {"name": name, "platform": agent.get("platform")}
@@ -333,9 +357,8 @@ def probe(agent: dict, timeout: int) -> dict:
             cmd = ["bash", "-lc", body]
         else:
             body = PS_PROBE.replace("@@CLI@@", cli).replace("@@REPO@@", repo)
-            enc = base64.b64encode(body.encode("utf-16-le")).decode()
             cmd = ["ssh", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes",
-                   agent["host"], f"powershell -NoProfile -EncodedCommand {enc}"]
+                   agent["host"], powershell_command(body)]
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         rec.update(parse_sections(proc.stdout))
         if not proc.stdout.strip():
