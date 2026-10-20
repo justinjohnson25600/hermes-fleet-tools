@@ -494,6 +494,12 @@ def resolve_python(host: str, pinned: str | None) -> tuple[str | None, str]:
                            capture_output=True, text=True, timeout=180, stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
         return pinned, "interpreter probe timed out; using the roster pin as-is"
+    if r.returncode == 255:
+        # ssh's own failure (connect, auth, host key): the probe never ran, so an empty
+        # stdout says nothing about Python. Reporting it as "no Python" sent operators to
+        # repair healthy installs while the real fault, an offline box, went unnamed.
+        why = ((r.stderr or "").strip().splitlines() or ["no detail"])[-1][:200]
+        return None, f"unreachable over SSH ({why}); check the box is on the tailnet, then re-run"
     m = re.search(r"^PY=(.*)$", r.stdout or "", re.M)
     found = (m.group(1).strip() if m else "") or None
     if not found:
