@@ -14,7 +14,11 @@ Deliberate behaviours, each earned from a real failure:
     The CDN lags a push by minutes and boxes silently install the OLD release.
   * Ships the payload as base64 to a temp file rather than inline `python -c`:
     long inline commands are truncated by cmd.exe.
-  * Cleans stale copies outside the canonical dir and profiles/.
+  * Cleans only the stale copies its own installer left (the pre-split top-level
+    dir, an old category dir under skills/), and only when they hold published
+    content. The Hermes install tree, plugins, profiles, backups and curator
+    archives belong to other owners and are never touched: walking the whole
+    home deleted a bundled Hermes skill that shared an estate skill's name.
   * Keeps what agents honed: a canonical or per-profile copy holding content the
     skills repo never published is HELD and reported, never overwritten (owner
     decision 2026-10-18). Copies of any published version are replaced. Without
@@ -88,15 +92,55 @@ def is_profile(prof):
             and any((prof / m).is_file() or (prof / m).is_symlink() for m in _IDENTITY))
 
 
+def canonical_dir(home, skill):
+    """The copy install.py owns: skills/<category>/<skill>, never under a dot-dir.
+
+    The curator archives into skills/.archive/<skill>, which the same glob matches, and sorted()
+    puts '.archive' before every category: an archived copy became "canonical" (the seed source
+    for every profile, and the real install the "stale" one).
+    """
+    hits = sorted(f.parent for f in _pl.Path(home).glob("skills/*/%s/SKILL.md" % skill)
+                  if not f.parent.parent.name.startswith("."))
+    return hits[0] if hits else None
+
+
+def stale_copies(home, skill, known):
+    """(remove, held): leftover copies of `skill` from the estate installer, split by content.
+
+    Candidates are only where that installer ever wrote: the pre-split top-level <home>/<skill> and
+    other category dirs under <home>/skills/ (a skill that changed category). The Hermes install
+    tree, plugins, profiles, backups and dot-dirs belong to other owners and are never candidates:
+    walking the whole home deleted the bundled skill inside hermes-agent/skills/ while an estate
+    skill shared its name (2026-10). A candidate is removed only when every file is published
+    content or matches the canonical copy; anything else is local work and is held, as in
+    seed_profiles. No canonical copy, nothing removed.
+    """
+    home = _pl.Path(home)
+    canon = canonical_dir(home, skill)
+    if canon is None:
+        return [], []
+    ours = set(known) | {content_hash(f.read_bytes()) for f in managed_files(canon)}
+    cands = [home / skill] if (home / skill / "SKILL.md").is_file() else []
+    cands += [f.parent for f in sorted(home.glob("skills/*/%s/SKILL.md" % skill))
+              if f.parent != canon and not f.parent.parent.name.startswith(".")]
+    remove, held = [], []
+    for d in cands:
+        edits = local_edits(managed_files(d), ours)
+        if edits:
+            held.append({"where": str(d), "files": edits[:10], "count": len(edits)})
+        else:
+            remove.append(d)
+    return remove, held
+
+
 def seed_profiles(home, skill, known, replace=False):
     """Seed each profile's copy of `skill` from the canonical install, holding honed copies."""
     home = _pl.Path(home)
     res = {"seeded": [], "replaced": [], "held": [], "errors": []}
-    canon = sorted(home.glob("skills/*/%s/SKILL.md" % skill))
+    canon = canonical_dir(home, skill)
     prof_root = home / "profiles"
-    if not canon or not prof_root.is_dir():
+    if canon is None or not prof_root.is_dir():
         return res
-    canon = canon[0].parent
     body = (canon / "SKILL.md").read_bytes()
     rel = canon.relative_to(home / "skills")
     for prof in sorted(prof_root.iterdir()):
@@ -130,10 +174,10 @@ def seed_profiles(home, skill, known, replace=False):
 def canonical_edits(home, skill, known, state):
     """Local edits in the default home's install of `skill`: its skill dir plus declared state files."""
     home = _pl.Path(home)
-    canon = sorted(home.glob("skills/*/%s/SKILL.md" % skill))
-    if not canon:
+    canon = canonical_dir(home, skill)
+    if canon is None:
         return []
-    files = managed_files(canon[0].parent)
+    files = managed_files(canon)
     state_dir, state_files = state or (None, [])
     if state_dir:
         files += [home / state_dir / f for f in state_files if (home / state_dir / f).is_file()]
@@ -145,6 +189,8 @@ content_hash = _honing["content_hash"]
 managed_files = _honing["managed_files"]
 local_edits = _honing["local_edits"]
 is_profile = _honing["is_profile"]
+canonical_dir = _honing["canonical_dir"]
+stale_copies = _honing["stale_copies"]
 seed_profiles = _honing["seed_profiles"]
 canonical_edits = _honing["canonical_edits"]
 
@@ -240,25 +286,20 @@ for s in SKILLS:
     if counts:
         rep["skills"][s]["verify"] = {"passed": int(counts[-1][0]), "failed": int(counts[-1][1])}
 
-# stale copies: anything outside the canonical category dir and outside
-# profiles/ (the stray top-level skill dir from the pre-split layout).
-# Per-profile copies are NOT stale by location: a named-profile session never
-# falls back to the default home's skills, so each profile needs its own copy
-# of the prompt files — they are reconciled by content below, not deleted.
+# Stale copies: only what the estate installer itself left (the pre-split top-level dir, an old
+# category dir), and only when it holds published content; local work there is held and reported
+# (stale_copies). Per-profile copies are NOT stale by location: a named-profile session never
+# falls back to the default home's skills, so each profile needs its own copy of the prompt
+# files - they are reconciled by content below, not deleted.
 cleaned = []
 if not DRY:
     for s in SKILLS:
         if s in HELD:
             continue
-        canon = list(HOME.glob("skills/*/%%s/SKILL.md" %% s))
-        canon = canon[0] if canon else None
-        stray = HOME / s / "SKILL.md"
-        if stray.is_file() and canon and stray != canon:
-            shutil.rmtree(HOME / s, ignore_errors=True); cleaned.append(str(stray))
-        for f in list(_walk(HOME, "%%s/SKILL.md" %% s)):
-            if "backups" in str(f) or f == canon or "profiles" in f.parts:
-                continue
-            shutil.rmtree(f.parent, ignore_errors=True); cleaned.append(str(f))
+        _rm, _kept = stale_copies(HOME, s, KNOWN.get(s, set()))
+        for d in _rm:
+            shutil.rmtree(d, ignore_errors=True); cleaned.append(str(d / "SKILL.md"))
+        rep["held"] += [dict(h, skill=s) for h in _kept]
 rep["cleaned"] = cleaned
 
 # per-profile visibility: seed every profile's skills dir from the canonical
@@ -284,8 +325,8 @@ for s in SKILLS:
     hits = [f for f in _walk(HOME, "%%s/SKILL.md" %% s) if "backups" not in str(f)]
     # Report the canonical copy. Walk order put profiles/ before skills/, so an
     # opted-out profile still holding an old copy was reported as the install.
-    canon = list(HOME.glob("skills/*/%%s/SKILL.md" %% s))
-    main = canon[0] if canon else (hits[0] if hits else None)
+    canon = canonical_dir(HOME, s)
+    main = (canon / "SKILL.md") if canon else (hits[0] if hits else None)
     v = ver(main) if main else None
     rep["skills"].setdefault(s, {})["version"] = v
     rep["skills"][s]["copies"] = len(hits)
