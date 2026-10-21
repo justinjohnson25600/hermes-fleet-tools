@@ -369,6 +369,10 @@ if t.is_file() and not DRY:
     fails = [l.strip()[:200] for l in (p.stdout or "").splitlines() if l.lstrip().startswith("FAIL ")][:5]
     if fails:
         rep["tests"]["fail_lines"] = fails
+    # Which suite ran: a held copy keeps older code, whose suite has fewer checks by design.
+    rep["tests"]["suite"] = content_hash(t.read_bytes())
+    _dp = sorted((HOME / "skills").glob("*/dev-pair/SKILL.md"))
+    rep["tests"]["devpair_version"] = ver(_dp[0]) if _dp else None
 try:
     tmp.unlink()
 except Exception:
@@ -420,6 +424,52 @@ def version_failures(r: dict, expected: dict | None) -> list[str]:
         if d.get("version") != want:
             out.append(f"{s}: installed {d.get('version')}, expected {want} from {RAW}")
     return out
+
+
+def check_count_findings(counts: list[dict]) -> tuple[list[tuple[str, str]], list[str]]:
+    """(warnings, notes) from dev-pair check counts: [{name, checks, platform, suite, version}].
+
+    A lower check count than its PEERS means checks are SKIPPING there, but only between boxes
+    that ran the same suite file on the same platform. A suite legitimately runs a different
+    number of checks per OS (os.name-guarded assertions), and a box whose dev-pair copy is held
+    keeps older code with an older, smaller suite. Comparing across either reported a correct
+    install as skipping, and a guard that cries wolf trains the reader to ignore real skips.
+    Rows without a suite hash (older payloads) compare with each other as before.
+    """
+    warns: list[tuple[str, str]] = []
+    notes: list[str] = []
+    by_platform: dict = {}
+    for r in counts:
+        by_platform.setdefault(r["platform"], []).append(r)
+    for plat, group in sorted(by_platform.items()):
+        by_suite: dict = {}
+        for r in group:
+            by_suite.setdefault(r.get("suite"), []).append(r)
+        for rows in by_suite.values():
+            best = max(r["checks"] for r in rows)
+            for r in rows:
+                if r["checks"] < best:
+                    peers = ", ".join(sorted(x["name"] for x in rows if x["checks"] == best))
+                    warns.append((r["name"], f"{r['checks']} checks vs {best} on the same platform and "
+                                             f"suite ({plat}: {peers}) — checks are being skipped, not "
+                                             f"passing. Investigate before trusting this install."))
+        if len(by_suite) > 1:
+            main = max(by_suite.values(), key=len)
+            ref = main[0]
+            for rows in by_suite.values():
+                if rows is main:
+                    continue
+                who = ", ".join(sorted(r["name"] for r in rows))
+                notes.append(f"{plat}: {who} ran dev-pair {rows[0].get('version') or '?'}'s suite "
+                             f"({max(r['checks'] for r in rows)} checks), {len(main)} box(es) ran "
+                             f"{ref.get('version') or '?'}'s ({max(r['checks'] for r in main)}); a held "
+                             f"copy keeps older code, so these are not compared.")
+    tops = {plat: max(r["checks"] for r in group) for plat, group in by_platform.items()}
+    if len(set(tops.values())) > 1:
+        spread = ", ".join(f"{p}={c}" for p, c in sorted(tops.items()))
+        notes.append(f"check counts differ by platform ({spread}) — expected when assertions are "
+                     f"platform-guarded; confirm the delta is explained.")
+    return warns, notes
 
 
 def format_versions(r: dict) -> str:
@@ -787,37 +837,16 @@ def main() -> int:
         if "passed" in t:
             # Checks RUN (passed + failed), not checks passed: only a smaller number of checks
             # run means checks were skipped. Comparing passed counts reported a failure as a skip.
-            counts.append((name, t["passed"] + t.get("failed", 0),
-                           (agent_by_name.get(name, {}) or {}).get("platform") or "unknown"))
+            counts.append({"name": name, "checks": t["passed"] + t.get("failed", 0),
+                           "platform": (agent_by_name.get(name, {}) or {}).get("platform") or "unknown",
+                           "suite": t.get("suite"), "version": t.get("devpair_version")})
 
-    # A lower check count than its PEERS means checks are SKIPPING there.
-    #
-    # Compare within a platform, never across. A suite legitimately runs a
-    # different number of checks per OS when assertions are guarded by
-    # os.name/sys.platform (argv-limit checks, for example, only exist on
-    # Windows), so a global max makes every node of the smaller-count platform
-    # warn forever on a perfectly correct install — and a guard that cries wolf
-    # on a correct fleet trains the reader to ignore the warnings that matter.
-    if counts:
-        by_platform = {}
-        for name, c, plat in counts:
-            by_platform.setdefault(plat, []).append((name, c))
-        for plat, group in sorted(by_platform.items()):
-            best = max(c for _, c in group)
-            for name, c in group:
-                if c < best:
-                    peers = ", ".join(sorted(n for n, cc in group if cc == best))
-                    print(f"  WARN {name}: {c} checks vs {best} on the same platform "
-                          f"({plat}: {peers}) — checks are being skipped, not passing. "
-                          f"Investigate before trusting this install.")
-                    failed.append(name)
-        # Cross-platform differences are reported as information, not failure:
-        # worth seeing (a real skip could hide here) but not actionable alone.
-        tops = {plat: max(c for _, c in group) for plat, group in by_platform.items()}
-        if len(set(tops.values())) > 1:
-            spread = ", ".join(f"{p}={c}" for p, c in sorted(tops.items()))
-            print(f"  note: check counts differ by platform ({spread}) — expected when "
-                  f"assertions are platform-guarded; confirm the delta is explained.")
+    warns, notes = check_count_findings(counts)
+    for name, msg in warns:
+        print(f"  WARN {name}: {msg}")
+        failed.append(name)
+    for n in notes:
+        print(f"  note: {n}")
 
     if held_total:
         print(f"\n{held_total} honed copy(ies) kept, not overwritten. Promote improvements to the skills "

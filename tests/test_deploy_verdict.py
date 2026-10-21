@@ -13,6 +13,7 @@ import functools
 import http.server
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -182,7 +183,12 @@ def test_remote_script_captures_the_failing_devpair_check_names(tmp_path):
     finally:
         httpd.shutdown()
     rep = json.loads(p.stdout.strip().splitlines()[-1])
-    assert rep["tests"] == {"passed": 1, "failed": 1, "fail_lines": ["FAIL  b  - detail of b"]}
+    tests = rep["tests"]
+    assert {k: tests[k] for k in ("passed", "failed", "fail_lines")} == {
+        "passed": 1, "failed": 1, "fail_lines": ["FAIL  b  - detail of b"]}
+    # which suite ran (a held copy runs an older one) and the box's dev-pair version
+    assert re.fullmatch(r"[0-9a-f]{16}", tests["suite"])
+    assert tests["devpair_version"] is None  # this sandbox home has no dev-pair skill dir
 
 
 def test_remote_script_end_to_end_reads_the_installers_stdout(tmp_path):
