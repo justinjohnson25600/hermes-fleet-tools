@@ -52,8 +52,11 @@ def _home(tmp_path: Path) -> Path:
 def test_directive_added_once_and_user_text_preserved(tmp_path):
     home = _home(tmp_path)
     prof = _profile(home, "client", b"# Persona\n\nBe kind.")
+    ino = os.stat(prof / "SOUL.md").st_ino
     first = _run(home, apply=True)
     assert first["default"]["status"] == first["client"]["status"] == "added"
+    # Rewritten in place: the same file object keeps its owner and ACL (Windows elevated-SSH trap).
+    assert os.stat(prof / "SOUL.md").st_ino == ino
     for soul, original in ((home / "SOUL.md", "You are the default agent.\n"), (prof / "SOUL.md", "# Persona\n\nBe kind.")):
         text = soul.read_text(encoding="utf-8")
         assert text.startswith(original.rstrip("\n"))

@@ -11,7 +11,8 @@ Rules, in the payload:
   * a changed block is replaced in place, an unchanged one is a no-op;
   * one marker without the other, or a repeated marker, is an error and the file is untouched;
   * the original bytes are backed up under <home>/backups/soul-directive/ before any write;
-  * the write is atomic (temp file + os.replace); a symlinked SOUL.md is reported, not followed.
+  * the file is rewritten in place, keeping its owner and ACL (Windows elevated-SSH trap);
+    a symlinked SOUL.md is reported, not followed.
 
   python soul_directive.py                 # dry run: what would change, per agent and profile
   python soul_directive.py --apply         # write
@@ -101,9 +102,14 @@ def visit(home, name):
     (bdir / ("SOUL.md." + stamp)).write_bytes(raw)
     out = new.replace("\n", "\r\n") if crlf else new
     data = (b"\xef\xbb\xbf" if bom else b"") + out.encode("utf-8")
-    tmp = soul.with_name(".SOUL.md.directive-%%d.tmp" %% os.getpid())
-    tmp.write_bytes(data)
-    os.replace(tmp, soul)
+    # Rewrite in place: the file keeps its owner and ACL. A replacement file minted over an
+    # elevated Windows SSH session can come out Administrators-only, and the non-elevated
+    # gateway would then lose the profile's identity. The backup above is the recovery path.
+    with open(soul, "r+b") as fh:
+        fh.write(data)
+        fh.truncate()
+        fh.flush()
+        os.fsync(fh.fileno())
     return {"profile": name, "status": verb + "ed" if verb == "add" else "updated"}
 
 
