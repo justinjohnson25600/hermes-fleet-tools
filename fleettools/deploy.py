@@ -509,15 +509,19 @@ def load_agents() -> dict:
     )
 
 
-def wait_for_cdn(skills: list[str], timeout: int = 420) -> dict:
+def wait_for_cdn(skills: list[str], timeout: int = 420, published: dict | None = None) -> dict:
     """Block until the CDN serves the versions this repo has. A push is not a
-    release: raw.githubusercontent caches, and boxes install the previous one."""
-    want = {}
+    release: raw.githubusercontent caches, and boxes install the previous one.
+
+    `published` (the skills repo's own versions, see published_versions) is the target. Without
+    it the wait used to fall back to "two CDN reads agree", which a stale CDN satisfies at once:
+    2026-11-05, five boxes got the new estate-experiments and were failed as 'expected 0.3.1'."""
+    want = dict(published or {})
     for s in skills:
         # Local manifest if this repo also holds the skills; otherwise ask the
         # remote what version it believes is current and wait for that to settle.
         f = ROOT / s / "skill.json"
-        if f.is_file():
+        if s not in want and f.is_file():
             want[s] = json.loads(f.read_text(encoding="utf-8"))["version"]
     if not want:
         # Nothing local to compare against: poll the remote until two reads
@@ -677,6 +681,19 @@ def published_hashes(repo: Path, skills: list[str]) -> dict[str, list[str]]:
     return out
 
 
+def published_versions(repo: Path, skills: list[str]) -> dict[str, str]:
+    """Each skill's version as published (the skills repo's origin/main skill.json)."""
+    ref, out = _published_ref(repo), {}
+    for s in skills:
+        try:
+            v = json.loads(_git(repo, "show", f"{ref}:{s}/skill.json")).get("version")
+        except (subprocess.CalledProcessError, ValueError):
+            continue
+        if isinstance(v, str):
+            out[s] = v
+    return out
+
+
 def state_files(repo: Path, skills: list[str]) -> dict[str, tuple[str, list[str]]]:
     """Each skill's install.py state dir and declared files (installed outside the skill dir)."""
     ref, out = _published_ref(repo), {}
@@ -806,8 +823,9 @@ def main() -> int:
         print("  --replace-honed: local edits WILL be overwritten")
 
     expected: dict | None = None
+    published = published_versions(repo, skills) if (repo / ".git").exists() else None
     if not args.dry_run and not args.no_wait:
-        cdn = wait_for_cdn(skills)
+        cdn = wait_for_cdn(skills, published=published)
         if cdn and cdn.get("current"):
             expected = {s: v for s, v in (cdn.get("want") or {}).items() if isinstance(v, str)}
         if cdn and not cdn["current"]:
