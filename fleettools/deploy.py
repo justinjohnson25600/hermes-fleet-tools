@@ -36,6 +36,7 @@ import base64
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -603,6 +604,38 @@ def resolve_python(host: str, pinned: str | None) -> tuple[str | None, str]:
 _HOLD: dict = {"known": {}, "state": {}, "replace": False}
 
 
+def deploy_targets(agents: list[dict]) -> list[dict]:
+    """Enabled agents, plus agents opted into skills alone with `skills_enabled`.
+
+    A box still being commissioned stays `enabled: false` so every other fleet controller keeps
+    skipping it, yet it can already receive skills and its SOUL.md directive."""
+    return [a for a in agents if a["enabled"] or a.get("skills_enabled")]
+
+
+def is_posix_remote(agent: dict) -> bool:
+    """A remote macOS or Linux box. Every other remote is Windows (PowerShell, %TEMP%)."""
+    return agent["host"] != "local" and agent.get("platform") in ("macos", "linux")
+
+
+def run_posix_payload(host: str, py: str, code: str, timeout: int) -> tuple[str, str | None]:
+    """(stdout, error) for `code` run by `py` on a POSIX box.
+
+    The payload travels on stdin (`python -`), so nothing is staged on the box. ssh's own exit
+    255 means the payload never ran: that is reported as unreachable, never as a payload fault."""
+    try:
+        p = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", host,
+                            shlex.quote(py) + " -"],
+                           input=code, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return "", f"payload timed out after {timeout}s"
+    if p.returncode == 255:
+        why = ((p.stderr or "").strip().splitlines() or ["no detail"])[-1][:200]
+        return "", f"unreachable over SSH ({why}); check the box is on the tailnet, then re-run"
+    if not (p.stdout or "").strip():
+        return "", f"{py} produced no output (exit {p.returncode}): {(p.stderr or '').strip()[-240:]}"
+    return p.stdout, None
+
+
 def _git(repo: Path, *args: str, data: bytes | None = None) -> bytes:
     return subprocess.run(["git", "-C", str(repo), *args], input=data, capture_output=True,
                           check=True).stdout
@@ -676,6 +709,10 @@ def deliver(agent: dict, skills: list[str], dry: bool) -> tuple[str, dict]:
     if host == "local":
         p = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=1800)
         out = p.stdout
+    elif is_posix_remote(agent):
+        out, err = run_posix_payload(host, agent.get("python") or "python3", code, 1800)
+        if err:
+            return name, {"error": err}
     else:
         py, note = resolve_python(host, agent.get("python"))
         if not py:
@@ -745,12 +782,15 @@ def main() -> int:
     # nothing local to validate against. A name that does not exist upstream
     # surfaces as a per-agent install failure, which is the honest place for it.
 
-    targets = [a for a in agents if a["enabled"]]
-    skipped = [a for a in agents if not a["enabled"]]
+    targets = deploy_targets(agents)
+    skipped = [a for a in agents if a not in targets]
     print(f"delivering {', '.join(skills)} to {len(targets)} agent(s)"
           f"{' [DRY RUN]' if args.dry_run else ''}")
     for a in skipped:
         print(f"  SKIP {a['name']}: {a.get('blocked_reason', 'disabled')[:110]}")
+    for a in targets:
+        if not a["enabled"]:
+            print(f"  SKILLS-ONLY {a['name']}: other fleet controllers still skip it (commissioning)")
 
     repo = Path(args.skills_repo).expanduser()
     _HOLD["replace"] = args.replace_honed

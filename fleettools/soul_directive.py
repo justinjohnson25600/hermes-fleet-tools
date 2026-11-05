@@ -140,6 +140,10 @@ def run_on(agent: dict, apply: bool, skill: str) -> tuple[str, dict]:
     if agent["host"] == "local":
         p = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=300)
         out = p.stdout
+    elif deploy.is_posix_remote(agent):
+        out, err = deploy.run_posix_payload(agent["host"], agent.get("python") or "python3", code, 300)
+        if err:
+            return agent["name"], {"error": err}
     else:
         py, note = deploy.resolve_python(agent["host"], agent.get("python"))
         if not py:
@@ -185,10 +189,10 @@ def main() -> int:
     args = ap.parse_args()
     deploy._ROSTER_OVERRIDE = args.roster
     cfg = deploy.load_agents()
-    targets = [a for a in cfg["agents"] if a["enabled"]]
+    targets = deploy.deploy_targets(cfg["agents"])
     print(f"SOUL.md directive -> {args.skill} on {len(targets)} agent(s){'' if args.apply else ' [DRY RUN]'}")
     for a in cfg["agents"]:
-        if not a["enabled"]:
+        if a not in targets:
             print(f"  SKIP {a['name']}: {a.get('blocked_reason', 'disabled')[:110]}")
     with ThreadPoolExecutor(max_workers=max(1, len(targets))) as ex:
         results = list(ex.map(lambda a: run_on(a, args.apply, args.skill), targets))
